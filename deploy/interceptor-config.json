@@ -1,0 +1,13 @@
+[
+  {
+    "interceptor": {
+      "lambda": {
+        "arn": "REPLACED_BY_DEPLOY_SCRIPT"
+      }
+    },
+    "interceptionPoints": ["REQUEST", "RESPONSE"],
+    "inputConfiguration": {
+      "passRequestHeaders": true
+    }
+  }
+]
