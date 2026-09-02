@@ -1,383 +1,93 @@
----
-name: AgentCore Interceptors Guide
-overview: AWS Bedrock AgentCore Gateway interceptors are Lambda functions that sit in the request/response path of an MCP or HTTP gateway, letting you inspect, transform, authorize, or short-circuit traffic before it reaches (or after it returns from) the target.
-todos:
-  - id: confirm-akto-api
-    content: Confirm api.akto.io/guardrail request/response contract (auth, payload shape, block vs allow signals)
-    status: pending
-  - id: write-lambda
-    content: Implement Akto-calling interceptor Lambda (REQUEST + RESPONSE, MCP JSON-RPC mapping, short-circuit on block)
-    status: pending
-  - id: wire-gateway
-    content: Create standalone AgentCore Gateway + attach interceptorConfigurations (passRequestHeaders for session ID)
-    status: pending
-  - id: iam-permissions
-    content: Grant gateway role lambda:InvokeFunction; Lambda egress to api.akto.io; store Akto auth token in Secrets Manager
-    status: pending
-  - id: document-llm-gap
-    content: Document that LLM guardrailing needs a separate path (HTTP target RESPONSE interceptors not yet available)
-    status: pending
-isProject: false
----
+# Akto for Amazon Bedrock AgentCore Gateway
 
-# Bedrock AgentCore Gateway Interceptors — How They Work
+Add Akto guardrails to an AgentCore Gateway interceptor without copying the
+integration implementation into your Lambda.
 
-## What interceptors are
+## Existing interceptor
 
-Interceptors are **Lambda functions** attached to an **AgentCore Gateway**. The gateway invokes your Lambda at defined **interception points** so you can:
+1. Attach the versioned Akto layer ARN for your AWS region to the Lambda.
+2. Set `AKTO_DATA_INGESTION_URL` and `AKTO_API_TOKEN`.
+3. Wrap the handler after defining it:
 
-- Inspect or log MCP/HTTP traffic
-- Validate or authorize requests
-- Transform request/response bodies or headers
-- **Short-circuit** the call by returning a synthetic response (skip the target entirely)
+Current public `us-east-1` layer:
 
-Docs:
-- [Types of interceptors](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html)
-- [Configuration](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-configuration.html)
-- [Examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-examples.html)
-
----
-
-## Architecture flow
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Gateway as AgentCoreGateway
-    participant ReqLambda as RequestInterceptorLambda
-    participant Target as GatewayTarget
-    participant ResLambda as ResponseInterceptorLambda
-
-    Client->>Gateway: MCP or HTTP request
-    Gateway->>ReqLambda: REQUEST interceptor event
-  alt transformedGatewayResponse returned
-        ReqLambda-->>Gateway: synthetic response
-        Gateway-->>Client: response (target never called)
-    else only transformedGatewayRequest
-        ReqLambda-->>Gateway: modified request
-        Gateway->>Target: forward request
-        Target-->>Gateway: response
-        Gateway->>ResLambda: RESPONSE interceptor event
-        ResLambda-->>Gateway: transformed response
-        Gateway-->>Client: final response
-    end
-```
-
-**Key rule:** If your interceptor output includes `transformedGatewayResponse`, the gateway returns that immediately — even if you also return `transformedGatewayRequest`. The target is not called. If both REQUEST and RESPONSE interceptors are configured and REQUEST returns a synthetic response, the RESPONSE interceptor is still invoked.
-
----
-
-## Two interception points
-
-| Type | When it runs | Typical uses |
-|------|--------------|--------------|
-| **REQUEST** | Before the gateway calls the target | Auth checks, request validation, logging, request mutation, block/deny |
-| **RESPONSE** | After the target responds, before the client gets the answer | Redaction, enrichment, audit logging, response mutation |
-
-**HTTP targets** (e.g. Bedrock AgentCore Runtime): **REQUEST only** today. RESPONSE interceptors for HTTP targets are documented as coming soon.
-
----
-
-## What you can intercept (by target type)
-
-### MCP targets (full support)
-
-**REQUEST interceptor receives:**
-- `gatewayRequest` — parsed JSON body, path (`/mcp`), HTTP method
-- `rawGatewayRequest.body` — raw request body string
-- `gatewayRequest.headers` — only if `passRequestHeaders: true`
-
-**RESPONSE interceptor receives:**
-- Original `gatewayRequest` (same as above)
-- `gatewayResponse` — `statusCode`, `body` (parsed JSON), optional `headers`
-- For streaming: `isStreamingResponse: true` and per-event `body`
-
-**What you can modify in output:**
-
-| Output field | REQUEST | RESPONSE (non-streaming) | RESPONSE (streaming, 1st event) | RESPONSE (streaming, later events) |
-|---|---|---|---|---|
-| `transformedGatewayRequest.body` | Yes | Yes (ignored if response override) | Yes | Yes |
-| `transformedGatewayResponse.body` | Yes (short-circuit) | Yes | Yes | Yes |
-| `transformedGatewayResponse.statusCode` | Yes | Yes | Yes | No (already sent) |
-| `transformedGatewayResponse.headers` | N/A | Yes | Yes | No (already sent) |
-
-**Streaming note:** RESPONSE interceptor is invoked **once per eligible stream event** (JSON-RPC messages with an `id`). It is **not** invoked for `notifications/progress`, `notifications/message`, or pings — those pass through directly.
-
-### HTTP targets (limited)
-
-Uses an `http` key instead of `mcp`. Differences:
-
-| Aspect | MCP target | HTTP target |
-|--------|-----------|-------------|
-| Body format | Parsed JSON object | Base64-encoded string |
-| Path | Always `/mcp` | Actual path (e.g. `/my-target/invocations`) |
-| `rawGatewayRequest` | Included | Not included |
-| RESPONSE interceptor | Supported | Not yet supported |
-| `httpMethod` | Immutable | Immutable (read-only in input) |
-
-**HTTP REQUEST output** can set:
-- `transformedGatewayRequest.headers` and `.body` (base64)
-- `transformedGatewayResponse` with `statusCode`, `headers`, `contentType`, `body` (base64) to short-circuit
-
----
-
-## How to use interceptors
-
-### Step 1 — Write a Lambda handler
-
-Minimal pass-through pattern (handles both REQUEST and RESPONSE):
+`arn:aws:lambda:us-east-1:041877753357:layer:akto-agentcore:3`
 
 ```python
-import logging
+from akto_agentcore import wrap_interceptor
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
-    mcp_data = event.get("mcp", {})
+    # Your existing interceptor logic stays unchanged.
+    ...
 
-    if mcp_data.get("gatewayResponse") is not None:
-        # RESPONSE interceptor
-        return {
-            "interceptorOutputVersion": "1.0",
-            "mcp": {
-                "transformedGatewayResponse": {
-                    "body": mcp_data["gatewayResponse"]["body"],
-                    "statusCode": mcp_data["gatewayResponse"].get("statusCode", 200),
-                }
-            },
-        }
 
-    # REQUEST interceptor
-    request_body = mcp_data["gatewayRequest"]["body"]
-    logger.info("MCP method: %s", request_body.get("method", "unknown"))
-    return {
-        "interceptorOutputVersion": "1.0",
-        "mcp": {
-            "transformedGatewayRequest": {"body": request_body}
-        },
-    }
+lambda_handler = wrap_interceptor(lambda_handler)
 ```
 
-**Detect REQUEST vs RESPONSE:** presence of non-null `gatewayResponse` in the event.
+Your interceptor runs first. Akto scans the effective payload after your
+transformations, so an Akto block or redaction cannot be bypassed by later
+handler code. Existing headers, status codes, and unrelated transformations
+are retained.
 
-**Required:** `interceptorOutputVersion` must always be `"1.0"`.
+## No existing interceptor
 
-### Step 2 — Attach interceptor to gateway
+Use this complete Lambda handler:
 
-Via AWS CLI on `create-gateway` or `update-gateway`:
+```python
+from akto_agentcore import lambda_handler
+```
+
+Attach that Lambda to the Gateway's `REQUEST` and `RESPONSE` interception
+points.
+
+## Configuration
+
+Required Lambda environment variables:
+
+- `AKTO_DATA_INGESTION_URL`
+- `AKTO_API_TOKEN`
+
+Optional:
+
+- `AKTO_FAIL_OPEN=false` — errors and unresolved approvals block by default.
+- `AKTO_TIMEOUT_SECONDS=30` — timeout for each Akto API call.
+- `AKTO_APPROVAL_WAIT_SECONDS=840`
+- `AKTO_APPROVAL_POLL_SECONDS=2`
+
+The Lambda timeout should be 900 seconds when human approval is enabled.
+
+## Supported traffic
+
+- MCP `tools/call` requests and tool results
+- Buffered HTTP request/response envelopes used by AgentCore Runtime,
+  inference, and custom targets
+- Allow, block, payload modification/redaction, and human approval
+
+AWS does not invoke HTTP interceptors for streaming targets. If the Gateway
+excludes `RESPONSE_BODY`, Akto cannot scan that response body.
+
+## Publish the layer
+
+Akto publishes immutable, versioned layer ARNs per AWS region. To build and
+publish from this repository:
 
 ```bash
-aws bedrock-agentcore-control create-gateway \
-  --name my-gateway-with-interceptors \
-  --role-arn arn:aws:iam::ACCOUNT:role/gateway-role \
-  --protocol-type MCP \
-  --authorizer-type CUSTOM_JWT \
-  --authorizer-configuration '{ ... }' \
-  --interceptor-configurations '[{
-    "interceptor": {
-      "lambda": {
-        "arn": "arn:aws:lambda:REGION:ACCOUNT:function:my-interceptor"
-      }
-    },
-    "interceptionPoints": ["REQUEST", "RESPONSE"],
-    "inputConfiguration": {
-      "passRequestHeaders": true
-    }
-  }]'
+AWS_REGION=us-east-1 deploy/publish-layer.sh
 ```
 
-Or with Boto3 (`bedrock-agentcore-control` client) — same `interceptorConfigurations` structure.
+The command prints the versioned layer ARN and makes that exact version
+attachable by other AWS accounts. `deploy/build-layer.sh` creates the same
+byte-for-byte ZIP for identical source.
 
-**CLI workflow with AgentCore CLI:** create/deploy gateway first (`agentcore add gateway` + `agentcore deploy`), then add interceptors via AWS CLI or Boto3 `update-gateway`.
+To deploy Akto's standalone interceptor Lambda, copy `deploy/.env.example`,
+pin `AKTO_LAYER_ARN` to the printed version, and run:
 
-### Step 3 — Configure `passRequestHeaders` carefully
-
-- Default: `false` — headers are **not** sent to your Lambda
-- Set `true` only when you need `Authorization`, `Mcp-Session-Id`, etc.
-- Headers may contain secrets — treat logs and storage accordingly
-
----
-
-## Common use cases
-
-1. **Audit/logging** — log MCP method, tool name, session ID on REQUEST; log results on RESPONSE
-2. **Authorization** — reject disallowed `tools/call` by returning `transformedGatewayResponse` with an error JSON-RPC body
-3. **PII redaction** — strip sensitive fields from RESPONSE bodies before they reach the client
-4. **Request enrichment** — inject metadata into the request body before forwarding to the target
-5. **Rate limiting / policy** — short-circuit with 429 or custom error without hitting the target
-
-### Short-circuit example (block a tool call)
-
-On REQUEST interceptor, return:
-
-```json
-{
-  "interceptorOutputVersion": "1.0",
-  "mcp": {
-    "transformedGatewayResponse": {
-      "statusCode": 403,
-      "body": {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "error": { "code": -32000, "message": "Tool not allowed" }
-      }
-    }
-  }
-}
+```bash
+deploy/deploy.sh
 ```
 
-Gateway never calls the target.
+AWS interceptor contracts:
 
----
-
-## IAM and operational requirements
-
-- Gateway service role must be allowed to **invoke** your interceptor Lambda
-- Interceptor Lambda should be in the same region as the gateway (typical AWS pattern)
-- Keep handlers fast — they are on the critical path for every request/response (or every stream event)
-- For streaming RESPONSE interceptors, design for **multiple invocations per client request**
-
----
-
-## Relation to this repo
-
-[`agentcore-bedrock`](/Users/shivanshagrawal/akto_code/agentcore-bedrock) is currently empty. A natural next step would be to add:
-
-- `lambda/interceptor/handler.py` — REQUEST/RESPONSE logic (logging, policy, redaction)
-- `infra/` or deploy script — gateway + interceptor Lambda + IAM wiring
-- Optional: mirror patterns from sibling Akto repos (`akto-gateway/mcp-endpoint-shield` `RequestProcessor` interface for policy/guardrail logic)
-
-This is informational only; no code changes are included in this plan.
-
----
-
-## Architecture walkthrough (user Q&A)
-
-### Does the gateway require an AgentCore agent?
-
-**No.** The Gateway is a **standalone managed MCP endpoint**. You can use it independently:
-
-```
-https://{gateway-id}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp
-```
-
-Any MCP client (Cursor, Claude Desktop, a custom app, or an AgentCore Runtime agent) can connect to this URL directly. The gateway aggregates tools from its **targets** (Lambda, OpenAPI, external MCP servers, API Gateway, etc.) into one unified `tools/list`.
-
-An AgentCore Runtime **agent is optional**. Typical patterns:
-
-| Pattern | Who calls whom | Interceptors apply to |
-|---------|----------------|----------------------|
-| **Gateway-only** | MCP client → Gateway → targets | All MCP traffic through gateway |
-| **Agent uses gateway as tool source** | Agent (runtime) → Gateway (MCP client) → targets | MCP traffic when agent calls tools via gateway |
-| **Gateway fronts runtime as HTTP target** | Client → Gateway → AgentCore Runtime (HTTP) | HTTP invocations to runtime (REQUEST only today) |
-
-Interceptors are attached to the **Gateway**, not to the agent. They run whenever traffic passes through the gateway — regardless of whether the caller is an agent, IDE, or another service.
-
-### What interceptors do NOT cover
-
-Traffic that **bypasses** the gateway is invisible to interceptors:
-
-- Direct Bedrock Runtime API calls (no gateway in path)
-- Direct connection to an MCP server (not via gateway)
-- Agent runtime invocations that don't route through a gateway HTTP target
-
-For those paths, you need a separate guardrail layer (e.g. Akto AI Agent Shield proxy, client-side hooks, or boto3 event hooks).
-
----
-
-## Akto guardrail integration (`api.akto.io/guardrail`)
-
-### How Akto guardrails work today (sibling repos)
-
-Akto already guardrails MCP and AI agent traffic via **proxy/shield** layers, not AgentCore interceptors:
-
-| Product | Path | What it guards |
-|-------|------|----------------|
-| **MCP Endpoint Shield** | `akto-gateway/mcp-endpoint-shield` | MCP requests/responses via `RequestProcessor` |
-| **AI Agent Shield** | `akto-gateway/ai-agent-shield` | HTTP proxy for Bedrock Converse / agent APIs |
-| **Client hooks** | `akto/apps/mcp-endpoint-shield/*` | POST to `{AKTO_URL}/api/http-proxy?guardrails=true` |
-
-The hooks and SDK integrations call Akto's HTTP proxy API with payloads shaped for validation. Your `api.akto.io/guardrail` endpoint is the SaaS equivalent of this ingestion/guardrail service.
-
-### Option A — AgentCore interceptor Lambda calls Akto (recommended for gateway path)
-
-Wire a Lambda interceptor on the AgentCore Gateway that:
-
-1. **REQUEST**: Extract MCP method/body (e.g. `tools/call` params) → POST to Akto guardrail → if blocked, return `transformedGatewayResponse` with JSON-RPC error; if allowed, pass through
-2. **RESPONSE**: Extract tool result → POST to Akto guardrail → if blocked/modified, return updated `transformedGatewayResponse`; else pass through
-
-```mermaid
-sequenceDiagram
-    participant MCPClient as MCPClient_or_Agent
-    participant Gateway as AgentCoreGateway
-    participant Interceptor as AktoInterceptorLambda
-    participant Akto as api.akto.io/guardrail
-    participant Target as MCPTarget
-
-    MCPClient->>Gateway: tools/call
-    Gateway->>Interceptor: REQUEST event
-    Interceptor->>Akto: validate request
-    Akto-->>Interceptor: allowed / blocked
-    alt blocked
-        Interceptor-->>Gateway: transformedGatewayResponse error
-        Gateway-->>MCPClient: blocked
-    else allowed
-        Interceptor-->>Gateway: pass-through request
-        Gateway->>Target: forward
-        Target-->>Gateway: result
-        Gateway->>Interceptor: RESPONSE event
-        Interceptor->>Akto: validate response
-        Interceptor-->>Gateway: pass-through or modified response
-        Gateway-->>MCPClient: final response
-    end
-```
-
-**What is possible:**
-- Block `tools/call` before target executes (REQUEST short-circuit)
-- Block/redact tool results before client sees them (RESPONSE)
-- Ingest/audit all MCP methods (`tools/list`, `initialize`, etc.)
-- Session tracking via `Mcp-Session-Id` header (requires `passRequestHeaders: true`)
-
-**Limitations:**
-- Adds Lambda cold-start + Akto API latency on every MCP operation
-- Streaming: RESPONSE interceptor runs per JSON-RPC event with `id`; progress/message notifications bypass interceptors
-- Must map MCP JSON-RPC payloads to Akto's expected validation payload format
-
-### Option B — Akto MCP Endpoint Shield in front of gateway (no AgentCore interceptors)
-
-Deploy Akto's MCP proxy between clients and the AgentCore Gateway (or between gateway and backend MCP targets). This is the mature, battle-tested path in `akto-gateway/mcp-endpoint-shield` with full streaming SSE support and session guardrailing.
-
-**Pros:** Full control, existing `ProcessRequest`/`ProcessResponse` logic, no Lambda limits
-**Cons:** Extra hop/infrastructure outside AWS managed gateway
-
-### Option C — Guardrail agent LLM calls (Bedrock Converse)
-
-AgentCore interceptors on **HTTP targets** currently support **REQUEST only** (RESPONSE coming soon). To guardrail LLM prompts/responses for an AgentCore Runtime agent:
-
-| Approach | MCP tools | LLM prompts/responses |
-|----------|-----------|----------------------|
-| Gateway interceptor → Akto | Yes (full REQUEST+RESPONSE) | Partial (REQUEST only via HTTP target) |
-| AI Agent Shield proxy | N/A | Yes (full pre/post guardrails) |
-| Client hooks (boto3, LangChain, etc.) | Via MCP hooks | Yes (pre/post LLM hooks) |
-
-For **both MCP and LLM**, you likely need a **combined architecture**:
-- Gateway interceptors (or MCP Endpoint Shield) for tool traffic
-- AI Agent Shield or client hooks for LLM traffic
-
-Unless/until HTTP RESPONSE interceptors ship, agent LLM response guardrailing through AgentCore alone is incomplete.
-
----
-
-## What is possible — summary matrix
-
-| Capability | AgentCore interceptor | Akto MCP Shield | Akto AI Agent Shield |
-|------------|----------------------|-----------------|---------------------|
-| Guardrail MCP `tools/call` request | Yes | Yes | No |
-| Guardrail MCP tool response | Yes | Yes | No |
-| Block before target executes | Yes | Yes | Yes (pre-forward) |
-| Guardrail LLM prompt (agent runtime) | REQUEST only (HTTP target) | No | Yes |
-| Guardrail LLM response | Not yet (HTTP) | No | Yes |
-| Works without AgentCore agent | Yes (gateway standalone) | Yes | Yes |
-| Managed by AWS | Yes | No (self-hosted) | No (self-hosted) |
-| Streaming MCP guardrails | Partial (per-event) | Yes | N/A |
+- https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html
+- https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-configuration.html
