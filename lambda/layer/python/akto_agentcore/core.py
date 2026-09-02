@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
 from http import HTTPStatus
@@ -53,7 +54,7 @@ logger.setLevel(logging.INFO)
 AKTO_DATA_INGESTION_URL = (os.getenv("AKTO_DATA_INGESTION_URL") or "").rstrip("/")
 AKTO_API_TOKEN = os.getenv("AKTO_API_TOKEN", "")
 
-AKTO_TIMEOUT = 5.0
+AKTO_TIMEOUT = float(os.getenv("AKTO_TIMEOUT_SECONDS", "30"))
 AKTO_APPROVAL_WAIT_SECONDS = float(os.getenv("AKTO_APPROVAL_WAIT_SECONDS", "840"))
 AKTO_APPROVAL_POLL_SECONDS = float(os.getenv("AKTO_APPROVAL_POLL_SECONDS", "2"))
 AKTO_APPROVAL_SAFETY_SECONDS = 5.0
@@ -96,19 +97,30 @@ def _post_json(url: str, payload: Dict[str, Any]) -> Any:
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
     start = time.time()
-    with urllib.request.urlopen(req, timeout=AKTO_TIMEOUT) as resp:
-        raw = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=AKTO_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+            duration_ms = int((time.time() - start) * 1000)
+            status = resp.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
         duration_ms = int((time.time() - start) * 1000)
-        status = resp.getcode()
         preview = raw if len(raw) <= 32000 else raw[:32000] + "...[truncated]"
-        logger.info(
+        logger.error(
             "Akto response: status=%s duration=%dms size=%d body=%s",
-            status, duration_ms, len(raw), preview,
+            exc.code, duration_ms, len(raw), preview,
         )
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return raw
+        raise
+
+    preview = raw if len(raw) <= 32000 else raw[:32000] + "...[truncated]"
+    logger.info(
+        "Akto response: status=%s duration=%dms size=%d body=%s",
+        status, duration_ms, len(raw), preview,
+    )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
 
 
 @dataclass(frozen=True)
@@ -561,7 +573,9 @@ def _handle_http_response(http: Dict[str, Any], context: Any = None) -> Dict[str
 
     logger.info("Guardrailing HTTP RESPONSE: status=%s path=%s", status_code, path)
     try:
-        request_payload = ""
+        # AWS documents gatewayRequest as null for HTTP RESPONSE interception.
+        # Akto still requires requestPayload to contain valid JSON.
+        request_payload = json.dumps({})
         if gateway_request.get("body"):
             request_payload = _decode_http_body(gateway_request["body"])
         payload = _build_ingest_payload(

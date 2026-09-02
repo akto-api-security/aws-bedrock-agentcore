@@ -11,7 +11,7 @@ integration implementation into your Lambda.
 
 Current public `us-east-1` layer:
 
-`arn:aws:lambda:us-east-1:041877753357:layer:akto-agentcore:1`
+`arn:aws:lambda:us-east-1:041877753357:layer:akto-agentcore:3`
 
 ```python
 from akto_agentcore import wrap_interceptor
@@ -51,6 +51,7 @@ Required Lambda environment variables:
 Optional:
 
 - `AKTO_FAIL_OPEN=false` — errors and unresolved approvals block by default.
+- `AKTO_TIMEOUT_SECONDS=30` — timeout for each Akto API call.
 - `AKTO_APPROVAL_WAIT_SECONDS=840`
 - `AKTO_APPROVAL_POLL_SECONDS=2`
 

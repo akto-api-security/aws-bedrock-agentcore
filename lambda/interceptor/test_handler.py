@@ -257,6 +257,7 @@ class HttpInterceptorTests(unittest.TestCase):
         body = _decode_output_body(result)
         self.assertIn("sensitive output", body["error"]["message"])
         ingest = post_json.call_args.args[1]
+        self.assertEqual(json.loads(ingest["requestPayload"]), {})
         self.assertIn("secret", ingest["responsePayload"])
 
     @patch.object(handler, "_post_json")
