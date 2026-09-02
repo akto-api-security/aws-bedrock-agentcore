@@ -33,13 +33,17 @@ fi
 : "${AKTO_DATA_INGESTION_URL:?set AKTO_DATA_INGESTION_URL in .env}"
 : "${AKTO_API_TOKEN:?set AKTO_API_TOKEN in .env}"
 : "${GATEWAY_IDS:?set GATEWAY_IDS in .env (one or more, comma/space separated)}"
+: "${AKTO_LAYER_ARN:?set AKTO_LAYER_ARN to a versioned public Akto layer ARN}"
 
 # --- Defaults ---------------------------------------------------------------
 FUNCTION_NAME="${FUNCTION_NAME:-akto-guardrails-interceptor}"
 LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-akto-interceptor-lambda-role}"
 LAMBDA_RUNTIME="${LAMBDA_RUNTIME:-python3.12}"
-LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-10}"
+LAMBDA_TIMEOUT="${LAMBDA_TIMEOUT:-900}"
 LAMBDA_MEMORY="${LAMBDA_MEMORY:-256}"
+AKTO_APPROVAL_WAIT_SECONDS="${AKTO_APPROVAL_WAIT_SECONDS:-840}"
+AKTO_APPROVAL_POLL_SECONDS="${AKTO_APPROVAL_POLL_SECONDS:-2}"
+AKTO_FAIL_OPEN="${AKTO_FAIL_OPEN:-false}"
 
 SRC_DIR="${REPO_ROOT}/lambda/interceptor"
 BUILD_ZIP="$(mktemp -d)/interceptor.zip"
@@ -74,9 +78,9 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Package
 # ---------------------------------------------------------------------------
-echo "==> 2/4 Packaging Lambda from ${SRC_DIR}"
+echo "==> 2/4 Packaging thin Lambda bootstrap from ${SRC_DIR}"
 ( cd "${SRC_DIR}" && zip -q -r "${BUILD_ZIP}" handler.py )
-LAMBDA_ENV="Variables={AKTO_DATA_INGESTION_URL=${AKTO_DATA_INGESTION_URL},AKTO_API_TOKEN=${AKTO_API_TOKEN}}"
+LAMBDA_ENV="Variables={AKTO_DATA_INGESTION_URL=${AKTO_DATA_INGESTION_URL},AKTO_API_TOKEN=${AKTO_API_TOKEN},AKTO_APPROVAL_WAIT_SECONDS=${AKTO_APPROVAL_WAIT_SECONDS},AKTO_APPROVAL_POLL_SECONDS=${AKTO_APPROVAL_POLL_SECONDS},AKTO_FAIL_OPEN=${AKTO_FAIL_OPEN}}"
 
 # ---------------------------------------------------------------------------
 # 3. Create / update the function
@@ -88,14 +92,14 @@ if aws_lambda get-function --function-name "${FUNCTION_NAME}" >/dev/null 2>&1; t
   aws_lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
   aws_lambda update-function-configuration --function-name "${FUNCTION_NAME}" \
     --timeout "${LAMBDA_TIMEOUT}" --memory-size "${LAMBDA_MEMORY}" \
-    --environment "${LAMBDA_ENV}" >/dev/null
+    --environment "${LAMBDA_ENV}" --layers "${AKTO_LAYER_ARN}" >/dev/null
   aws_lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
 else
   aws_lambda create-function --function-name "${FUNCTION_NAME}" \
     --runtime "${LAMBDA_RUNTIME}" --handler "handler.lambda_handler" \
     --role "${LAMBDA_ROLE_ARN}" --zip-file "fileb://${BUILD_ZIP}" \
     --timeout "${LAMBDA_TIMEOUT}" --memory-size "${LAMBDA_MEMORY}" \
-    --environment "${LAMBDA_ENV}" >/dev/null
+    --environment "${LAMBDA_ENV}" --layers "${AKTO_LAYER_ARN}" >/dev/null
   aws_lambda wait function-active-v2 --function-name "${FUNCTION_NAME}"
 fi
 
