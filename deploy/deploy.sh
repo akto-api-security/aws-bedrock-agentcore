@@ -123,12 +123,11 @@ attach_to_gateway() {
     return 1
   fi
 
-  local gw_role_arn name role_arn authorizer_type authorizer_config
+  local gw_role_arn name role_arn authorizer_type
   gw_role_arn="$(echo "${current}" | jq -r '.roleArn')"
   name="$(echo "${current}" | jq -r '.name')"
   role_arn="${gw_role_arn}"
   authorizer_type="$(echo "${current}" | jq -r '.authorizerType')"
-  authorizer_config="$(echo "${current}" | jq -c '.authorizerConfiguration')"
 
   # Grant this gateway's execution role permission to invoke the Lambda.
   echo "    Granting ${gw_role_arn##*/} lambda:InvokeFunction"
@@ -148,7 +147,6 @@ attach_to_gateway() {
     --name "${name}"
     --role-arn "${role_arn}"
     --authorizer-type "${authorizer_type}"
-    --authorizer-configuration "${authorizer_config}"
     --interceptor-configurations "${INTERCEPTOR_CONFIG}"
   )
   local add
@@ -158,6 +156,8 @@ attach_to_gateway() {
     if [ "${3:-}" = "raw" ]; then val="$(echo "${current}" | jq -r "${1}")"; fi
     args+=("${2}" "${val}")
   }
+  # AWS_IAM gateways have no authorizerConfiguration; passing null fails validation.
+  add '.authorizerConfiguration'      --authorizer-configuration
   add '.description'                  --description           raw
   add '.kmsKeyArn'                    --kms-key-arn           raw
   add '.exceptionLevel'              --exception-level        raw
@@ -166,7 +166,10 @@ attach_to_gateway() {
   add '.policyEngineConfiguration'   --policy-engine-configuration
   add '.wafConfiguration'            --waf-configuration
 
-  aws bedrock-agentcore-control update-gateway "${args[@]}" >/dev/null
+  if ! aws bedrock-agentcore-control update-gateway "${args[@]}" >/dev/null; then
+    echo "    update-gateway failed for ${gw}" >&2
+    return 1
+  fi
   echo "    ✓ ${gw} attached"
 }
 
