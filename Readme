@@ -3,6 +3,9 @@
 Add Akto guardrails to an AgentCore Gateway interceptor without copying the
 integration implementation into your Lambda.
 
+For AWS Management Console steps (new Lambda vs existing interceptor), see
+[docs/manual-deployment.md](docs/manual-deployment.md).
+
 ## Existing interceptor
 
 1. Attach the versioned Akto layer ARN for your AWS region to the Lambda.
@@ -86,6 +89,9 @@ pin `AKTO_LAYER_ARN` to the printed version, and run:
 ```bash
 deploy/deploy.sh
 ```
+
+For the same deployment in the AWS Management Console (no scripts), follow
+[docs/manual-deployment.md](docs/manual-deployment.md).
 
 AWS interceptor contracts:
 
