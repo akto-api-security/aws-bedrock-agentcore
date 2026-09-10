@@ -38,6 +38,7 @@ import binascii
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -382,6 +383,10 @@ _CUSTOM_AGENT_HEADERS = (
     "x-amzn-bedrock-agentcore-runtime-custom-bot-name",
 )
 
+# HTTP-family runtime targets:
+#   /{prefix}/runtimes/arn:...:runtime/{runtimeId}/invocations
+_RUNTIME_INVOCATION_PATH = re.compile(r":runtime/([^/]+)/invocations", re.IGNORECASE)
+
 
 def _caller_from_headers(headers: Dict[str, str]) -> str:
     """Agent name a caller declared about itself, or "" if it declared none."""
@@ -405,14 +410,14 @@ def _resolve_caller_agent(headers: Optional[Dict[str, str]] = None) -> Dict[str,
         # A self-declared name is weaker evidence than an AWS-supplied principal,
         # so it is only consulted once the stronger source has come up empty.
         declared = _caller_from_headers(headers or {})
-        if not declared:
-            return {}
-        resolved = agent_for_role(declared) or None
-        out = {"agent-name": declared, "agent-name-source": "caller-declared"}
-        if resolved:
-            out["agent-type"] = resolved.get("type", "")
-            out["agent-role-arn"] = resolved.get("role_arn", "")
-        return out
+        if declared:
+            resolved = agent_for_role(declared) or None
+            out = {"agent-name": declared, "agent-name-source": "caller-declared"}
+            if resolved:
+                out["agent-type"] = resolved.get("type", "")
+                out["agent-role-arn"] = resolved.get("role_arn", "")
+            return out
+        return {}
     role = role_name_from_principal(principal)
     if not role:
         return {"caller-principal": principal}
@@ -542,6 +547,16 @@ def _ensure_host(headers: Dict[str, str], is_mcp: bool) -> Dict[str, str]:
     return {**headers, "host": f"{AKTO_CONNECTOR}.{suffix}"}
 
 
+def _set_host_header(headers: Dict[str, str], host: str) -> Dict[str, str]:
+    """Replace Host (any casing) for AI-agent traffic so guardrails can scope
+    policies on bot-name."""
+    if not host:
+        return headers
+    cleaned = {k: v for k, v in headers.items()
+               if not (isinstance(k, str) and k.lower() == "host")}
+    return {**cleaned, "host": host}
+
+
 def _client_ip(headers: Dict[str, str]) -> str:
     for key in ("X-Forwarded-For", "x-forwarded-for", "X-Real-Ip", "x-real-ip"):
         val = headers.get(key)
@@ -634,11 +649,17 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     agent_profile = _agent_role_profile(caller)
     gateway_profile = _gateway_role_profile(identity.get("gateway_id", ""))
     tags = _build_tags(is_mcp, identity, caller, agent_profile, gateway_profile)
+    if not caller.get("agent-name"):
+        match = _RUNTIME_INVOCATION_PATH.search(path)
+        if match:
+            tags["bot-name"] = derive_gateway_name(match.group(1))
     # Request phase has no response yet -> default to 200/OK; response phase
     # carries the real gateway status. statusCode is numeric; status is the
     # HTTP reason phrase ("OK", "Not Found", ...).
     code = status_code if status_code is not None else 200
     request_headers = _ensure_host(request_headers, is_mcp)
+    if not is_mcp:
+        request_headers = _set_host_header(request_headers, tags.get("bot-name", ""))
     # awsMetadata travels INSIDE responsePayload, not as a top-level field.
     # AKTO's ingest schema is fixed, so an unrecognised top-level key is dropped
     # server-side and never reaches the reader — which is exactly how the
