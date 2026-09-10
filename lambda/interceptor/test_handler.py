@@ -876,7 +876,9 @@ class PayloadIdentityTests(unittest.TestCase):
 
     def test_falls_back_to_the_gateway_when_the_caller_is_unknown(self):
         tags = json.loads(self._payload("")["tag"])
-        self.assertEqual(tags["bot-name"], "asl-gateway-demo")
+        # The host verbatim — AKTO's collection is keyed on the same value.
+        self.assertEqual(tags["bot-name"], GATEWAY_HOST)
+        self.assertEqual(tags["gateway-name"], "asl-gateway-demo")
         self.assertEqual(tags["agentType"], "AGENTCORE_GATEWAY")
         self.assertNotIn("caller-role", tags)
 

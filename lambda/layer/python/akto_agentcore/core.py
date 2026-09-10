@@ -499,7 +499,11 @@ def _build_tags(is_mcp: bool, identity: Optional[Dict[str, str]] = None,
         **kind,
         "service": AKTO_CONNECTOR,
         "agentType": caller.get("agent-type") or AGENT_TYPE,
-        "bot-name": caller.get("agent-name") or identity.get("gateway_name") or identity.get("gateway_id", ""),
+        # The Host header verbatim. AKTO groups traffic into collections by host,
+        # so naming the graph node the same thing keeps the node and the
+        # collection describing one object instead of two. The derived short
+        # name is still available separately as gateway-name.
+        "bot-name": caller.get("agent-name") or identity.get("host") or identity.get("gateway_id", ""),
         "agent-name": caller.get("agent-name", ""),
         # Provenance matters: a name the caller declared about itself is weaker
         # evidence than one AWS supplied, and a reader should be able to tell.
