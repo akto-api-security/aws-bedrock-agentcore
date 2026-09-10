@@ -963,6 +963,27 @@ class PayloadIdentityTests(unittest.TestCase):
     def test_empty_values_are_dropped_rather_than_sent_as_blanks(self):
         self.assertNotIn("", json.loads(self._payload(RUNTIME_ARN)["tag"]).values())
 
+    def test_http_runtime_path_sets_bot_name(self):
+        """HTTP-family runtime targets embed the runtime in the path; the gateway
+        supplies no caller principal, so bot-name must come from there."""
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = "041877753357"
+        path = (
+            "/demo-agent/runtimes/arn:aws:bedrock-agentcore:us-east-1:041877753357:"
+            "runtime/asl_demo_agent_demo-wxoIOE9Fdr/invocations"
+        )
+        payload = handler._build_ingest_payload(
+            request_payload='{"prompt": "What does API security testing cover?"}',
+            response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST},
+            response_headers={},
+            status_code=200,
+            is_mcp=False,
+            path=path,
+            method="POST",
+        )
+        self.assertEqual(json.loads(payload["tag"])["bot-name"], "asl_demo_agent_demo")
+
     def test_caller_declared_agent_header_sets_bot_name(self):
         """The gateway supplies no caller identity, so a self-declared custom
         header is the only route to naming the calling agent."""
