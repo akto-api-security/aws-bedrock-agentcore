@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AgentCoreReadForEnrichment",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetGateway",
+        "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:GetHarness"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RoleReadForPermissionProfile",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRolePolicies",
+        "iam:GetRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/*"
+    },
+    {
+      "Sid": "PolicyDocumentRead",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:policy/*",
+        "arn:aws:iam::aws:policy/*"
+      ]
+    }
+  ]
+}
