@@ -45,6 +45,11 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from typing import Any, Dict, Optional
 
+from .agentcore_lookup import (account_id_from_context, agent_for_role,
+                               gateway_role_arn, role_name_from_principal)
+from .gateway_naming import derive_gateway_name, extract_gateway_id_from_host
+from .iam_permissions import get_role_security_profile
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -62,6 +67,26 @@ AKTO_CONNECTOR = "agentcore_gateway"   # akto_connector query param + client tag
 CONTEXT_SOURCE = "AGENTIC"             # contextSource for policy filtering
 INTERCEPTOR_OUTPUT_VERSION = "1.0"
 GUARDED_METHODS = {"tools/call"}
+
+# Matches the discovery pipeline in akto_aws_bedrock_discovery, so a gateway AKTO
+# discovered and the traffic flowing through it group together in the dashboard.
+AKTO_SOURCE = os.getenv("AKTO_SOURCE", "AWS_BEDROCK")
+AGENT_TYPE = "AGENTCORE_GATEWAY"
+AWS_REGION = os.getenv("AWS_REGION", "")
+# The interceptor event's identity shape is not documented for AWS_IAM gateways.
+# Logged once per container so a deployment can confirm what it actually gets
+# instead of guessing; set to "false" once you have seen it.
+LOG_REQUEST_CONTEXT = os.getenv("AKTO_LOG_REQUEST_CONTEXT", "true").lower() != "false"
+# Logs the exact body POSTed to AKTO. Off by default: the payload contains the
+# prompt and the tool result, which is the traffic itself. For debugging a
+# deployment, not for steady state.
+LOG_PAYLOAD = os.getenv("AKTO_LOG_PAYLOAD", "false").lower() == "true"
+
+# Set once per invocation from the event and the Lambda context, because
+# _build_ingest_payload is reached from four call sites that would otherwise
+# each have to thread them through.
+_INVOCATION: Dict[str, str] = {"principal": "", "account_id": ""}
+_context_logged = False
 
 # Request headers never forwarded to Akto (secrets).
 _SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie", "x-api-key", "x-amz-security-token"}
@@ -87,6 +112,17 @@ def _build_http_proxy_url(*, guardrails: bool = False, response_guardrails: bool
     if ingest_data:
         params.append("ingest_data=true")
     return f"{AKTO_DATA_INGESTION_URL}/api/http-proxy?{'&'.join(params)}"
+
+
+def _log_payload(url: str, payload: Dict[str, Any]) -> None:
+    """Dump what is about to be sent, when explicitly enabled."""
+    if not LOG_PAYLOAD:
+        return
+    try:
+        leg = "REQUEST+ingest" if "ingest_data=true" in url else "RESPONSE"
+        logger.info("AKTO payload [%s] -> %s\n%s", leg, url, json.dumps(payload)[:20000])
+    except Exception as exc:
+        logger.warning("Could not log payload: %s", exc)
 
 
 def _post_json(url: str, payload: Dict[str, Any]) -> Any:
@@ -265,12 +301,223 @@ def _is_mcp_body(body: Any) -> bool:
     return isinstance(body, dict) and str(body.get("jsonrpc", "")) == "2.0"
 
 
-def _build_tags(is_mcp: bool) -> Dict[str, str]:
-    """Tag MCP traffic as an MCP server/client; tag everything else (LLM / AI
-    agent calls) as gen-ai."""
-    if is_mcp:
-        return {"mcp-server": "MCP Server", "service": AKTO_CONNECTOR}
-    return {"gen-ai": "Gen AI", "service": AKTO_CONNECTOR}
+def _caller_principal(event: Dict[str, Any]) -> str:
+    """The identity of whoever called the gateway, from the interceptor event.
+
+    AWS's interceptor example reads `requestContext.identity`, but documents no
+    shape for an AWS_IAM-authorized gateway, so several plausible keys are tried
+    in order of usefulness: an ARN names the role outright, while a bare user id
+    may or may not. Returns "" rather than guessing when nothing looks like an
+    identity — an unattributed call is better than a wrongly attributed one.
+    """
+    contexts = []
+    for holder in (event, event.get("mcp") or {}, event.get("http") or {}):
+        if isinstance(holder, dict) and isinstance(holder.get("requestContext"), dict):
+            contexts.append(holder["requestContext"])
+    for rc in contexts:
+        identity = rc.get("identity") if isinstance(rc.get("identity"), dict) else {}
+        for source in (identity, rc):
+            for key in ("callerArn", "userArn", "arn", "principalArn", "caller",
+                        "principalId", "userId", "user"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _log_request_context_once(event: Dict[str, Any]) -> None:
+    """One line per container describing the identity surface actually present.
+
+    Values are not logged — only the shape — so this stays safe to leave on.
+    """
+    global _context_logged
+    if _context_logged or not LOG_REQUEST_CONTEXT:
+        return
+    _context_logged = True
+    try:
+        rc = event.get("requestContext")
+        shape = {
+            "event_keys": sorted(k for k in event if isinstance(k, str)),
+            "requestContext_keys": sorted(rc) if isinstance(rc, dict) else None,
+            "identity_keys": sorted(rc["identity"]) if isinstance(rc, dict)
+                             and isinstance(rc.get("identity"), dict) else None,
+            "principal_resolved": bool(_caller_principal(event)),
+            # Header names only — the last place a caller identity could be.
+            "header_keys": sorted(
+                (((event.get("mcp") or {}).get("gatewayRequest") or {}).get("headers") or {})
+            ) or None,
+        }
+        logger.info("Interceptor identity surface: %s", json.dumps(shape))
+    except Exception as exc:
+        logger.warning("Could not describe request context: %s", exc)
+
+
+def _resolve_gateway_identity(headers: Dict[str, str]) -> Dict[str, str]:
+    """Which gateway this call came through, from the Host header.
+
+    Name resolution is derived from the ID rather than looked up, so a gateway
+    that has never been seen before is still named correctly and no per-gateway
+    configuration is needed.
+    """
+    host = ""
+    for key, value in (headers or {}).items():
+        if isinstance(key, str) and key.lower() == "host":
+            host = str(value).split(":")[0]
+            break
+    gateway_id, confidence = extract_gateway_id_from_host(host)
+    return {"host": host, "gateway_id": gateway_id,
+            "gateway_name": derive_gateway_name(gateway_id) if gateway_id else "",
+            "confidence": confidence}
+
+
+# AgentCore rejects custom headers beginning with X-Amzn- except this one
+# family, which is therefore the only supported way for a calling agent to
+# identify itself to an interceptor. A live probe confirmed the gateway supplies
+# no caller identity of its own: the event carries only interceptorInputVersion
+# and mcp, with no requestContext, and the forwarded headers name the gateway
+# (Host) and the transport, never the caller.
+_CUSTOM_AGENT_HEADERS = (
+    "x-amzn-bedrock-agentcore-runtime-custom-agent-name",
+    "x-amzn-bedrock-agentcore-runtime-custom-agent-id",
+    "x-amzn-bedrock-agentcore-runtime-custom-bot-name",
+)
+
+
+def _caller_from_headers(headers: Dict[str, str]) -> str:
+    """Agent name a caller declared about itself, or "" if it declared none."""
+    for key, value in (headers or {}).items():
+        if isinstance(key, str) and key.lower() in _CUSTOM_AGENT_HEADERS:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _resolve_caller_agent(headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The AgentCore agent behind this call, when the principal names one.
+
+    This is what makes bot-name the *agent* rather than the gateway: one gateway
+    serves several agents, so only the per-request principal can tell them apart.
+    """
+    principal = _INVOCATION.get("principal", "")
+    if not principal:
+        # No principal from the event, so fall back to what the caller declared.
+        # A self-declared name is weaker evidence than an AWS-supplied principal,
+        # so it is only consulted once the stronger source has come up empty.
+        declared = _caller_from_headers(headers or {})
+        if not declared:
+            return {}
+        resolved = agent_for_role(declared) or None
+        out = {"agent-name": declared, "agent-name-source": "caller-declared"}
+        if resolved:
+            out["agent-type"] = resolved.get("type", "")
+            out["agent-role-arn"] = resolved.get("role_arn", "")
+        return out
+    role = role_name_from_principal(principal)
+    if not role:
+        return {"caller-principal": principal}
+    resolved = agent_for_role(role)
+    out = {"caller-principal": principal, "caller-role": role}
+    if resolved:
+        out["agent-name"] = resolved.get("name", "")
+        out["agent-type"] = resolved.get("type", "")
+        out["agent-role-arn"] = resolved.get("role_arn", "")
+    return out
+
+
+def _agent_role_profile(caller: Dict[str, str]) -> Dict[str, str]:
+    """Permissions of the *calling agent's* execution role.
+
+    Emitted under the `harness-` names the discovery pipeline in
+    akto_aws_bedrock_discovery already uses (harness-execution-role,
+    harness-role-policies, ...), so a downstream reader sees one field set
+    whether the record came from discovery or from this interceptor. The prefix
+    is kept even when the caller is a Runtime rather than a Harness: matching
+    the existing contract matters more here than the resource's own noun.
+    """
+    role_arn = caller.get("agent-role-arn") or ""
+    if not role_arn:
+        return {}
+    try:
+        profile = dict(get_role_security_profile(role_arn, "harness"))
+        profile["harness-execution-role-arn"] = role_arn
+        profile["harness-execution-role"] = role_arn.split("/")[-1]
+        return profile
+    except Exception as exc:
+        logger.warning("Agent role profile failed for %s: %s", role_arn, exc)
+        return {}
+
+
+def _gateway_role_profile(gateway_id: str) -> Dict[str, str]:
+    """Permissions of the gateway's own execution role — the identity it uses to
+    reach the MCP backends behind it.
+
+    Never blocks the call: the lookups are cached with a TTL, and any failure
+    (no permission, throttling, a cold cache) yields no tags rather than delay.
+    """
+    if not gateway_id:
+        return {}
+    try:
+        role_arn = gateway_role_arn(gateway_id)
+        if not role_arn:
+            return {}
+        profile = dict(get_role_security_profile(role_arn, "gateway"))
+        profile["gateway-execution-role-arn"] = role_arn
+        # Two fields carry the harness- names the downstream reader consumes.
+        # The gateway role has no attached managed policies — everything it can
+        # do is inline — so the inline list is what belongs in the policies
+        # field, not the empty attached one.
+        profile["harness-execution-role"] = role_arn.split("/")[-1]
+        profile["harness-role-policies"] = profile.pop("gateway-role-inline-policies", "")
+        profile.pop("gateway-role-policies", None)
+        return profile
+    except Exception as exc:
+        logger.warning("Gateway role profile failed for %s: %s", gateway_id, exc)
+        return {}
+
+
+def _build_tags(is_mcp: bool, identity: Optional[Dict[str, str]] = None,
+                caller: Optional[Dict[str, str]] = None,
+                agent_profile: Optional[Dict[str, str]] = None,
+                gateway_profile: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Tags for one intercepted call.
+
+    MCP traffic is tagged as an MCP server/client and everything else (LLM /
+    AI-agent calls) as gen-ai, as before. The identity half mirrors what the
+    discovery pipeline puts on a gateway's discovery message, so the discovered
+    gateway and its live traffic are recognisably the same thing.
+
+    bot-name prefers the *calling agent* over the gateway: a gateway serves many
+    agents, and naming the gateway on every call would collapse them into one.
+    It falls back to the gateway only when the caller cannot be attributed.
+    """
+    identity = identity or {}
+    caller = caller or {}
+    kind = {"mcp-server": "MCP Server"} if is_mcp else {"gen-ai": "Gen AI"}
+    tags = {
+        "source": AKTO_SOURCE,
+        **kind,
+        "service": AKTO_CONNECTOR,
+        "agentType": caller.get("agent-type") or AGENT_TYPE,
+        "bot-name": caller.get("agent-name") or identity.get("gateway_name") or identity.get("gateway_id", ""),
+        "agent-name": caller.get("agent-name", ""),
+        # Provenance matters: a name the caller declared about itself is weaker
+        # evidence than one AWS supplied, and a reader should be able to tell.
+        "agent-name-source": caller.get("agent-name-source", ""),
+        "caller-role": caller.get("caller-role", ""),
+        "caller-principal": caller.get("caller-principal", ""),
+        "gateway-id": identity.get("gateway_id", ""),
+        "gateway-name": identity.get("gateway_name", ""),
+        "account-id": _INVOCATION.get("account_id", ""),
+        "region": AWS_REGION,
+        # Both profiles use the harness- names, so ordering is the precedence
+        # rule: the gateway's role is the fallback, and the calling agent's own
+        # role overwrites it whenever it could be resolved.
+        **(gateway_profile or {}),
+        **(agent_profile or {}),
+    }
+    # An empty value is worse than an absent key: it looks like a real answer.
+    return {k: v for k, v in tags.items() if v not in ("", None)}
 
 
 def _clean_headers(headers: Any) -> Dict[str, str]:
@@ -307,6 +554,68 @@ def _status_phrase(code: int) -> str:
         return ""
 
 
+def _build_trace_data(request_payload: str) -> Dict[str, Any]:
+    """toolsSummary for the tool this request is calling.
+
+    The runtime's graph builder reads traceData.toolsSummary.tools to draw the
+    agent -> tool edges. An interceptor sees exactly one tool call per request,
+    so the summary is that one tool with a count of one — accurate rather than
+    aggregated, and the graph merges repeats across requests itself.
+    """
+    try:
+        body = json.loads(request_payload) if request_payload else {}
+    except (TypeError, ValueError):
+        return {"toolsSummary": {}}
+    if not isinstance(body, dict) or body.get("method") != "tools/call":
+        return {"toolsSummary": {}}
+    name = ((body.get("params") or {}).get("name") or "").strip()
+    if not name:
+        return {"toolsSummary": {}}
+    return {"toolsSummary": {"tools": [name], "totalToolCalls": 1}}
+
+
+def _build_aws_metadata(tags: Dict[str, str], request_payload: str = "") -> Dict[str, Any]:
+    """The role/permission subset of the tags, plus what the graph builder needs.
+
+    Mirrors traceDiscovery.js: `tag` is a JSON string a consumer has to parse
+    separately, so anything needed to answer "what could this agent do" is also
+    placed in the message body. Deliberately a subset — identity tags such as
+    bot-name and region live in `tag`, exactly as they do on the discovery side.
+
+    `model` and `traceData` are required by BedrockAgentTraceParser's validity
+    check; without both, canParse() rejects the record and no trace, spans or
+    service graph are produced at all. `model` is deliberately empty: a gateway
+    interceptor sees MCP tool traffic and never a model call, so there is no
+    honest value, and inventing one would put a node in the service graph that
+    corresponds to nothing.
+    """
+    keep = ("-role-", "-execution-role", "-permissions-boundary")
+    metadata: Dict[str, Any] = {k: v for k, v in tags.items() if any(m in k for m in keep)}
+    metadata["model"] = ""
+    metadata["traceData"] = _build_trace_data(request_payload)
+    return metadata
+
+
+def _embed_aws_metadata(response_payload: str, aws_metadata: Dict[str, str]) -> str:
+    """Attach awsMetadata to the response body, the way the discovery pipeline does.
+
+    The body here is the real MCP response rather than a synthesised one, so it
+    is only extended when it is a JSON object and there is something to add —
+    a non-object body (or an empty profile) is passed through untouched rather
+    than reshaped into something the caller never sent.
+    """
+    if not aws_metadata:
+        return response_payload
+    try:
+        parsed = json.loads(response_payload) if response_payload else {}
+    except (TypeError, ValueError):
+        return response_payload
+    if not isinstance(parsed, dict):
+        return response_payload
+    parsed["awsMetadata"] = aws_metadata
+    return json.dumps(parsed)
+
+
 def _build_ingest_payload(*, request_payload: str, response_payload: str,
                           request_headers: Dict[str, str], response_headers: Dict[str, str],
                           status_code: Optional[int], is_mcp: bool,
@@ -314,12 +623,26 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     """HTTP-proxy IngestDataBatch shape expected by the guardrails service
     (models.IngestDataBatch). Carries the real gateway headers/status, not
     synthesised values."""
-    tags = _build_tags(is_mcp)
+    # Resolve before _ensure_host, so the gateway comes from its real Host header
+    # rather than the synthetic fallback that replaces a missing one.
+    identity = _resolve_gateway_identity(request_headers)
+    caller = _resolve_caller_agent(request_headers)
+    agent_profile = _agent_role_profile(caller)
+    gateway_profile = _gateway_role_profile(identity.get("gateway_id", ""))
+    tags = _build_tags(is_mcp, identity, caller, agent_profile, gateway_profile)
     # Request phase has no response yet -> default to 200/OK; response phase
     # carries the real gateway status. statusCode is numeric; status is the
     # HTTP reason phrase ("OK", "Not Found", ...).
     code = status_code if status_code is not None else 200
     request_headers = _ensure_host(request_headers, is_mcp)
+    # awsMetadata travels INSIDE responsePayload, not as a top-level field.
+    # AKTO's ingest schema is fixed, so an unrecognised top-level key is dropped
+    # server-side and never reaches the reader — which is exactly how the
+    # discovery pipeline does it (traceMessageBuilder.js builds
+    # responsePayload = {response, awsMetadata}).
+    aws_metadata = _build_aws_metadata(tags, request_payload)
+    response_payload = _embed_aws_metadata(response_payload, aws_metadata)
+
     return {
         "path": path,
         "requestHeaders": json.dumps(request_headers),
@@ -519,6 +842,7 @@ def _handle_http_request(http: Dict[str, Any], context: Any = None) -> Dict[str,
             method=method,
         )
         guardrails_url = _build_http_proxy_url(guardrails=True, ingest_data=True)
+        _log_payload(guardrails_url, payload)
         result = _parse_guardrails_result(_post_json(guardrails_url, payload))
         logger.info(
             "Guardrails parsed HTTP REQUEST: allowed=%s behaviour=%s status=%s "
@@ -589,6 +913,7 @@ def _handle_http_response(http: Dict[str, Any], context: Any = None) -> Dict[str
             method=method,
         )
         guardrails_url = _build_http_proxy_url(response_guardrails=True)
+        _log_payload(guardrails_url, payload)
         result = _parse_guardrails_result(_post_json(guardrails_url, payload))
         logger.info(
             "Guardrails parsed HTTP RESPONSE: allowed=%s behaviour=%s status=%s "
@@ -653,6 +978,7 @@ def _handle_request(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
             is_mcp=_is_mcp_body(body),
         )
         guardrails_url = _build_http_proxy_url(guardrails=True, ingest_data=True)
+        _log_payload(guardrails_url, payload)
         raw_result = _post_json(guardrails_url, payload)
         result = _parse_guardrails_result(raw_result)
         logger.info(
@@ -734,6 +1060,7 @@ def _handle_response(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             is_mcp=_is_mcp_body(req_body),
         )
         guardrails_url = _build_http_proxy_url(response_guardrails=True)
+        _log_payload(guardrails_url, payload)
         raw_result = _post_json(guardrails_url, payload)
         result = _parse_guardrails_result(raw_result)
         logger.info(
@@ -785,6 +1112,10 @@ def lambda_handler(event, context):
     https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html
     """
     try:
+        _INVOCATION["principal"] = _caller_principal(event)
+        _INVOCATION["account_id"] = account_id_from_context(context)
+        _log_request_context_once(event)
+
         if isinstance(event.get("http"), dict):
             http = event["http"]
             if http.get("gatewayResponse") is not None:
