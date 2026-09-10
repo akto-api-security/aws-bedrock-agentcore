@@ -871,6 +871,12 @@ class PayloadIdentityTests(unittest.TestCase):
         self.assertEqual(tags["agentType"], "RUNTIME")
         self.assertEqual(tags["caller-role"], "asl-demo-agent-execution-demo-karan")
 
+    def test_mcp_traffic_keeps_the_gateway_host(self):
+        payload = self._payload(RUNTIME_ARN)
+        headers = json.loads(payload["requestHeaders"])
+        host = next(v for k, v in headers.items() if k.lower() == "host")
+        self.assertEqual(host, GATEWAY_HOST)
+
     def test_same_gateway_different_caller_gets_a_different_bot_name(self):
         self.assertEqual(json.loads(self._payload(HARNESS_ARN)["tag"])["bot-name"], "harness_khsh4")
 
@@ -983,6 +989,7 @@ class PayloadIdentityTests(unittest.TestCase):
             method="POST",
         )
         self.assertEqual(json.loads(payload["tag"])["bot-name"], "asl_demo_agent_demo")
+        self.assertEqual(json.loads(payload["requestHeaders"])["host"], "asl_demo_agent_demo")
 
     def test_caller_declared_agent_header_sets_bot_name(self):
         """The gateway supplies no caller identity, so a self-declared custom

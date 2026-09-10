@@ -547,6 +547,16 @@ def _ensure_host(headers: Dict[str, str], is_mcp: bool) -> Dict[str, str]:
     return {**headers, "host": f"{AKTO_CONNECTOR}.{suffix}"}
 
 
+def _set_host_header(headers: Dict[str, str], host: str) -> Dict[str, str]:
+    """Replace Host (any casing) for AI-agent traffic so guardrails can scope
+    policies on bot-name."""
+    if not host:
+        return headers
+    cleaned = {k: v for k, v in headers.items()
+               if not (isinstance(k, str) and k.lower() == "host")}
+    return {**cleaned, "host": host}
+
+
 def _client_ip(headers: Dict[str, str]) -> str:
     for key in ("X-Forwarded-For", "x-forwarded-for", "X-Real-Ip", "x-real-ip"):
         val = headers.get(key)
@@ -648,6 +658,8 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     # HTTP reason phrase ("OK", "Not Found", ...).
     code = status_code if status_code is not None else 200
     request_headers = _ensure_host(request_headers, is_mcp)
+    if not is_mcp:
+        request_headers = _set_host_header(request_headers, tags.get("bot-name", ""))
     # awsMetadata travels INSIDE responsePayload, not as a top-level field.
     # AKTO's ingest schema is fixed, so an unrecognised top-level key is dropped
     # server-side and never reaches the reader — which is exactly how the
