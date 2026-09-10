@@ -4,7 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from akto_agentcore import core as handler
+from akto_agentcore import agentcore_lookup, core as handler, gateway_naming
 from akto_agentcore import wrap_interceptor
 
 
@@ -760,6 +760,245 @@ class ExistingHandlerStillRunsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "customer interceptor failed"):
             wrapped(self.event, None)
         self.assertEqual(self.calls, ["ran"])
+
+
+GATEWAY_HOST = "asl-gateway-demo-lfexb4ol0c.gateway.bedrock-agentcore.us-east-1.amazonaws.com"
+RUNTIME_ARN = ("arn:aws:sts::041877753357:assumed-role/"
+               "asl-demo-agent-execution-demo-karan/BedrockAgentCore-9f2c")
+HARNESS_ARN = ("arn:aws:sts::041877753357:assumed-role/"
+               "AmazonBedrockAgentCoreHarnessDefaultServiceRole-7oktr/BedrockAgentCore-1a2b")
+
+
+class GatewayNamingTests(unittest.TestCase):
+    """Must stay behaviourally identical to gatewayNaming.js: discovery and live
+    traffic have to derive the same name or they look like two gateways."""
+
+    def test_strict_agentcore_host(self):
+        self.assertEqual(gateway_naming.extract_gateway_id_from_host(GATEWAY_HOST),
+                         ("asl-gateway-demo-lfexb4ol0c", "strict"))
+
+    def test_lenient_first_label_for_unknown_format(self):
+        self.assertEqual(gateway_naming.extract_gateway_id_from_host("something.else.com"),
+                         ("something", "lenient"))
+
+    def test_rejects_non_gateway_hosts(self):
+        for host in ("", "localhost", "10.1.2.3", "1234.example.com", "agentcore_gateway.mcp"):
+            self.assertEqual(gateway_naming.extract_gateway_id_from_host(host)[0], "", host)
+
+    def test_port_is_ignored(self):
+        self.assertEqual(gateway_naming.extract_gateway_id_from_host(GATEWAY_HOST + ":443")[0],
+                         "asl-gateway-demo-lfexb4ol0c")
+
+    def test_derive_name_strips_the_ten_char_suffix(self):
+        self.assertEqual(gateway_naming.derive_gateway_name("asl-gateway-demo-lfexb4ol0c"),
+                         "asl-gateway-demo")
+
+    def test_derive_name_refuses_to_strip_to_something_implausible(self):
+        # "ab-1234567890" would become "ab"; a slightly odd name beats a wrong one.
+        self.assertEqual(gateway_naming.derive_gateway_name("ab-1234567890"), "ab-1234567890")
+
+
+class CallerIdentityTests(unittest.TestCase):
+    def test_reads_caller_arn_from_request_context(self):
+        event = {"requestContext": {"identity": {"callerArn": RUNTIME_ARN}}}
+        self.assertEqual(handler._caller_principal(event), RUNTIME_ARN)
+
+    def test_reads_identity_nested_under_mcp(self):
+        event = {"mcp": {"requestContext": {"identity": {"arn": RUNTIME_ARN}}}}
+        self.assertEqual(handler._caller_principal(event), RUNTIME_ARN)
+
+    def test_absent_identity_yields_empty_rather_than_a_guess(self):
+        self.assertEqual(handler._caller_principal({"mcp": {"gatewayRequest": {}}}), "")
+
+    def test_role_name_from_assumed_role_and_iam_arns(self):
+        self.assertEqual(agentcore_lookup.role_name_from_principal(RUNTIME_ARN),
+                         "asl-demo-agent-execution-demo-karan")
+        self.assertEqual(
+            agentcore_lookup.role_name_from_principal(
+                "arn:aws:iam::041877753357:role/service-role/SomeRole"), "SomeRole")
+
+    def test_non_role_principals_are_not_forced_into_a_role_name(self):
+        self.assertEqual(agentcore_lookup.role_name_from_principal("arn:aws:iam::1:user/bob"), "")
+
+    def test_account_id_comes_from_the_lambda_context_arn(self):
+        class Ctx:
+            invoked_function_arn = "arn:aws:lambda:us-east-1:041877753357:function:f"
+        self.assertEqual(agentcore_lookup.account_id_from_context(Ctx()), "041877753357")
+
+
+class PayloadIdentityTests(unittest.TestCase):
+    """bot-name must name the calling agent, not the gateway: one gateway serves
+    several agents, so naming the gateway would collapse them into one."""
+
+    def setUp(self):
+        self._agents = {
+            "asl-demo-agent-execution-demo-karan": {
+                "name": "asl_demo_agent_demo", "type": "RUNTIME",
+                "role_arn": "arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan"},
+            "AmazonBedrockAgentCoreHarnessDefaultServiceRole-7oktr": {
+                "name": "harness_khsh4", "type": "HARNESS",
+                "role_arn": "arn:aws:iam::041877753357:role/service-role/"
+                            "AmazonBedrockAgentCoreHarnessDefaultServiceRole-7oktr"},
+        }
+        self._saved = (handler.agent_for_role, handler.gateway_role_arn,
+                       handler.get_role_security_profile, handler.AWS_REGION)
+        handler.agent_for_role = self._agents.get
+        handler.gateway_role_arn = lambda gid: "arn:aws:iam::041877753357:role/asl-gateway-service-role-demo-karan"
+        handler.get_role_security_profile = lambda arn, prefix: {
+            f"{prefix}-role-services": "bedrock,s3",
+            f"{prefix}-role-policies": "AgentPolicy",
+            f"{prefix}-role-inline-policies": "invoke-akto-guardrails-interceptor",
+        }
+        handler.AWS_REGION = "us-east-1"
+
+    def tearDown(self):
+        (handler.agent_for_role, handler.gateway_role_arn,
+         handler.get_role_security_profile, handler.AWS_REGION) = self._saved
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = ""
+
+    def _payload(self, principal):
+        handler._INVOCATION["principal"] = principal
+        handler._INVOCATION["account_id"] = "041877753357"
+        return handler._build_ingest_payload(
+            request_payload="{}", response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST}, response_headers={},
+            status_code=200, is_mcp=True)
+
+    def test_bot_name_is_the_calling_runtime(self):
+        tags = json.loads(self._payload(RUNTIME_ARN)["tag"])
+        self.assertEqual(tags["bot-name"], "asl_demo_agent_demo")
+        self.assertEqual(tags["agentType"], "RUNTIME")
+        self.assertEqual(tags["caller-role"], "asl-demo-agent-execution-demo-karan")
+
+    def test_same_gateway_different_caller_gets_a_different_bot_name(self):
+        self.assertEqual(json.loads(self._payload(HARNESS_ARN)["tag"])["bot-name"], "harness_khsh4")
+
+    def test_falls_back_to_the_gateway_when_the_caller_is_unknown(self):
+        tags = json.loads(self._payload("")["tag"])
+        # The host verbatim — AKTO's collection is keyed on the same value.
+        self.assertEqual(tags["bot-name"], GATEWAY_HOST)
+        self.assertEqual(tags["gateway-name"], "asl-gateway-demo")
+        self.assertEqual(tags["agentType"], "AGENTCORE_GATEWAY")
+        self.assertNotIn("caller-role", tags)
+
+    def test_agent_role_uses_the_harness_field_names(self):
+        """Downstream reads harness-execution-role / harness-role-policies, so the
+        CALLING AGENT's role must land there — not the gateway's."""
+        tags = json.loads(self._payload(RUNTIME_ARN)["tag"])
+        self.assertEqual(tags["harness-execution-role"], "asl-demo-agent-execution-demo-karan")
+        self.assertEqual(tags["harness-execution-role-arn"],
+                         "arn:aws:iam::041877753357:role/asl-demo-agent-execution-demo-karan")
+        self.assertEqual(tags["harness-role-policies"], "AgentPolicy")
+        self.assertEqual(tags["harness-role-services"], "bedrock,s3")
+
+    def test_harness_role_arn_keeps_the_iam_path(self):
+        tags = json.loads(self._payload(HARNESS_ARN)["tag"])
+        self.assertIn("/service-role/", tags["harness-execution-role-arn"])
+        self.assertEqual(tags["harness-execution-role"],
+                         "AmazonBedrockAgentCoreHarnessDefaultServiceRole-7oktr")
+
+    def test_only_two_gateway_fields_use_the_harness_names(self):
+        """Everything else about the gateway role keeps its gateway- prefix."""
+        tags = json.loads(self._payload("")["tag"])
+        self.assertEqual(tags["harness-execution-role"], "asl-gateway-service-role-demo-karan")
+        self.assertEqual(tags["harness-role-policies"], "invoke-akto-guardrails-interceptor")
+        self.assertEqual(tags["gateway-execution-role-arn"],
+                         "arn:aws:iam::041877753357:role/asl-gateway-service-role-demo-karan")
+        self.assertEqual(tags["gateway-role-services"], "bedrock,s3")
+        self.assertNotIn("gateway-execution-role", tags)
+        self.assertNotIn("gateway-role-inline-policies", tags)
+
+    def test_gateway_identity_tags_remain(self):
+        tags = json.loads(self._payload(RUNTIME_ARN)["tag"])
+        self.assertEqual(tags["gateway-id"], "asl-gateway-demo-lfexb4ol0c")
+        self.assertEqual(tags["gateway-name"], "asl-gateway-demo")
+        self.assertEqual(tags["source"], "AWS_BEDROCK")
+        self.assertEqual(tags["account-id"], "041877753357")
+        self.assertEqual(tags["region"], "us-east-1")
+
+    def test_aws_metadata_is_the_role_subset_not_the_whole_tag_set(self):
+        payload = self._payload(RUNTIME_ARN)
+        # Nested inside responsePayload, exactly as the discovery pipeline sends it.
+        self.assertNotIn("awsMetadata", payload)
+        meta = json.loads(payload["responsePayload"])["awsMetadata"]
+        self.assertIsInstance(meta, dict)
+        self.assertEqual(meta["harness-execution-role"], "asl-demo-agent-execution-demo-karan")
+        self.assertEqual(meta["harness-role-policies"], "AgentPolicy")
+        # Identity tags stay in `tag`, exactly as on the discovery side.
+        for identity_key in ("bot-name", "source", "region", "account-id", "agentType"):
+            self.assertNotIn(identity_key, meta)
+        # model and traceData are graph-builder inputs, not tags; everything else
+        # in awsMetadata must still come from the tag set.
+        self.assertEqual(meta["model"], "")
+        self.assertIn("traceData", meta)
+        role_fields = set(meta) - {"model", "traceData"}
+        self.assertTrue(role_fields.issubset(set(json.loads(payload["tag"]))))
+
+    def test_trace_data_names_the_tool_being_called(self):
+        """BedrockAgentTraceParser draws agent -> tool edges from this."""
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = "041877753357"
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "mac-akto-api-mcp___searchDocumentation"}})
+        payload = handler._build_ingest_payload(
+            request_payload=body, response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST}, response_headers={},
+            status_code=200, is_mcp=True)
+        meta = json.loads(payload["responsePayload"])["awsMetadata"]
+        summary = meta["traceData"]["toolsSummary"]
+        self.assertEqual(summary["tools"], ["mac-akto-api-mcp___searchDocumentation"])
+        self.assertEqual(summary["totalToolCalls"], 1)
+
+    def test_non_tool_call_yields_an_empty_tools_summary(self):
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = "041877753357"
+        payload = handler._build_ingest_payload(
+            request_payload=json.dumps({"method": "tools/list"}), response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST}, response_headers={},
+            status_code=200, is_mcp=True)
+        meta = json.loads(payload["responsePayload"])["awsMetadata"]
+        self.assertEqual(meta["traceData"]["toolsSummary"], {})
+
+    def test_empty_values_are_dropped_rather_than_sent_as_blanks(self):
+        self.assertNotIn("", json.loads(self._payload(RUNTIME_ARN)["tag"]).values())
+
+    def test_caller_declared_agent_header_sets_bot_name(self):
+        """The gateway supplies no caller identity, so a self-declared custom
+        header is the only route to naming the calling agent."""
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = "041877753357"
+        payload = handler._build_ingest_payload(
+            request_payload="{}", response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST,
+                             "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Agent-Name": "asl_demo_agent_demo"},
+            response_headers={}, status_code=200, is_mcp=True)
+        tags = json.loads(payload["tag"])
+        self.assertEqual(tags["bot-name"], "asl_demo_agent_demo")
+        self.assertEqual(tags["agent-name-source"], "caller-declared")
+
+    def test_event_principal_wins_over_a_declared_header(self):
+        handler._INVOCATION["principal"] = RUNTIME_ARN
+        handler._INVOCATION["account_id"] = "041877753357"
+        payload = handler._build_ingest_payload(
+            request_payload="{}", response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST,
+                             "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Agent-Name": "impostor"},
+            response_headers={}, status_code=200, is_mcp=True)
+        tags = json.loads(payload["tag"])
+        self.assertEqual(tags["bot-name"], "asl_demo_agent_demo")
+        self.assertNotIn("agent-name-source", tags)
+
+    def test_identity_is_resolved_from_the_real_host_not_the_synthetic_one(self):
+        handler._INVOCATION["principal"] = ""
+        payload = handler._build_ingest_payload(
+            request_payload="{}", response_payload="{}",
+            request_headers={}, response_headers={}, status_code=200, is_mcp=True)
+        tags = json.loads(payload["tag"])
+        # No Host means no gateway; the synthetic fallback must not be mistaken for one.
+        self.assertNotIn("gateway-id", tags)
+        self.assertEqual(json.loads(payload["requestHeaders"])["host"], "agentcore_gateway.mcp")
+
 
 
 if __name__ == "__main__":

@@ -74,6 +74,46 @@ if [ -z "${LAMBDA_ROLE_ARN:-}" ]; then
     echo "    Waiting ~10s for role propagation..."
     sleep 10
   fi
+
+  # Read-only lookups the interceptor uses to enrich what it sends to AKTO:
+  # which gateway was called and what its execution role may do, and which
+  # AgentCore agent made the call. All fail open, so a missing permission costs
+  # tags rather than traffic — but then the enrichment silently does nothing,
+  # which is why it is granted here rather than left to be discovered later.
+  # GetPolicy/GetPolicyVersion address a POLICY arn, not a role arn, so they
+  # need their own statement; AWS-managed policies live under the aws alias.
+  echo "    Granting read-only discovery permissions to ${LAMBDA_ROLE_NAME}"
+  aws iam put-role-policy \
+    --role-name "${LAMBDA_ROLE_NAME}" \
+    --policy-name "akto-interceptor-discovery" \
+    --policy-document '{
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow",
+          "Action": [
+            "bedrock-agentcore:GetGateway",
+            "bedrock-agentcore:ListAgentRuntimes",
+            "bedrock-agentcore:GetAgentRuntime",
+            "bedrock-agentcore:ListHarnesses",
+            "bedrock-agentcore:GetHarness"
+          ],
+          "Resource": "*" },
+        { "Effect": "Allow",
+          "Action": [
+            "iam:GetRole",
+            "iam:ListAttachedRolePolicies",
+            "iam:ListRolePolicies",
+            "iam:GetRolePolicy"
+          ],
+          "Resource": "arn:aws:iam::*:role/*" },
+        { "Effect": "Allow",
+          "Action": [
+            "iam:GetPolicy",
+            "iam:GetPolicyVersion"
+          ],
+          "Resource": ["arn:aws:iam::*:policy/*", "arn:aws:iam::aws:policy/*"] }
+      ]
+    }' >/dev/null
 fi
 
 # ---------------------------------------------------------------------------
