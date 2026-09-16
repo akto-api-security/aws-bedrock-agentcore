@@ -49,6 +49,7 @@ from typing import Any, Dict, Optional
 from .agentcore_lookup import (account_id_from_context, agent_for_role,
                                gateway_role_arn, role_name_from_principal)
 from .gateway_naming import derive_gateway_name, extract_gateway_id_from_host
+from .gateway_targets import target_for_tool, targets_for_gateway
 from .iam_permissions import get_role_security_profile
 
 logger = logging.getLogger()
@@ -82,6 +83,16 @@ LOG_REQUEST_CONTEXT = os.getenv("AKTO_LOG_REQUEST_CONTEXT", "true").lower() != "
 # prompt and the tool result, which is the traffic itself. For debugging a
 # deployment, not for steady state.
 LOG_PAYLOAD = os.getenv("AKTO_LOG_PAYLOAD", "false").lower() == "true"
+# Announce the gateway and every server behind it once per container, so an
+# inventory exists in AKTO before anyone calls a tool. A backend that is never
+# exercised is exactly the one worth knowing about, and waiting for traffic
+# would leave it invisible.
+DISCOVER_ON_START = os.getenv("AKTO_DISCOVER_ON_START", "true").lower() != "false"
+# Hard ceiling on that announcement. It runs inline on the first invocation —
+# a guardrail decision must never wait on inventory, so the budget is small and
+# exceeding it abandons the pass rather than delaying the call.
+DISCOVERY_BUDGET_SECONDS = float(os.getenv("AKTO_DISCOVERY_BUDGET_SECONDS", "5"))
+_discovery_done = False
 
 # Set once per invocation from the event and the Lambda context, because
 # _build_ingest_payload is reached from four call sites that would otherwise
@@ -481,6 +492,148 @@ def _gateway_role_profile(gateway_id: str) -> Dict[str, str]:
         return {}
 
 
+def _discovery_record(bot_name: str, host: str, extra: Dict[str, str]) -> Dict[str, Any]:
+    """A metadata-only record: a resource that exists, with no traffic attached."""
+    tags = {
+        "source": AKTO_SOURCE,
+        "service": AKTO_CONNECTOR,
+        "agentType": AGENT_TYPE,
+        "bot-name": bot_name,
+        "account-id": _INVOCATION.get("account_id", ""),
+        "region": AWS_REGION,
+        "discovery-type": "METADATA_ONLY",
+        "has-conversations": "false",
+        **{k: v for k, v in extra.items() if v not in ("", None)},
+    }
+    return {
+        "path": "/mcp",
+        "requestHeaders": json.dumps({"host": host, "Content-Type": "application/json"}),
+        "responseHeaders": json.dumps({}),
+        "method": "POST",
+        "requestPayload": json.dumps({"discovery": bot_name}),
+        "responsePayload": json.dumps({"awsMetadata": _build_aws_metadata(tags, "")}),
+        "ip": "",
+        "time": str(int(time.time() * 1000)),
+        "statusCode": 200,
+        "type": "HTTP/1.1",
+        "status": "OK",
+        "akto_account_id": "1000000",
+        "akto_vxlan_id": 0,
+        "is_pending": "false",
+        "source": "MIRRORING",
+        "tag": json.dumps(tags),
+        "metadata": json.dumps(tags),
+        "contextSource": CONTEXT_SOURCE,
+    }
+
+
+def _announce_inventory(gateway_id: str, gateway_name: str, gateway_host: str) -> None:
+    """Send one record for the gateway and one per server behind it.
+
+    Best-effort and time-boxed: this sits in front of a guardrail decision, so a
+    slow or failing control-plane read abandons the announcement instead of
+    holding up the call. Runs once per container.
+    """
+    global _discovery_done
+    if _discovery_done or not DISCOVER_ON_START or not gateway_id:
+        return
+    _discovery_done = True
+
+    deadline = time.time() + DISCOVERY_BUDGET_SECONDS
+    try:
+        targets = targets_for_gateway(gateway_id)
+        records = [_discovery_record(
+            gateway_name or gateway_id, gateway_host,
+            {"gateway-id": gateway_id, "gateway-name": gateway_name,
+             **_gateway_inventory(gateway_id),
+             **_gateway_role_profile(gateway_id)},
+        )]
+        for target in targets:
+            name = target.get("name", "")
+            records.append(_discovery_record(
+                f"{name}.{gateway_name}" if gateway_name else name,
+                target.get("host", ""),
+                {"gateway-id": gateway_id, "gateway-name": gateway_name,
+                 "mcp-server-name": name,
+                 "mcp-server-target-id": target.get("target_id", ""),
+                 "mcp-server-kind": target.get("kind", ""),
+                 "mcp-server-endpoint": target.get("backend", ""),
+                 "mcp-server-host": target.get("host", ""),
+                 "mcp-server-auth": target.get("auth", ""),
+                 "mcp-server-status": target.get("status", ""),
+                 "mcp-server-listing-mode": target.get("listing_mode", ""),
+                 "mcp-server-private": target.get("private", "")},
+            ))
+
+        # Same path live traffic takes: without guardrails=true the proxy
+        # acknowledges the POST but never runs it through the ingest pipeline.
+        url = _build_http_proxy_url(guardrails=True, ingest_data=True)
+        for record in records:
+            if time.time() > deadline:
+                logger.warning("Discovery budget exhausted — %d record(s) not sent", len(records))
+                return
+            _log_payload(url, record)
+            _post_json(url, record)
+        logger.info("Announced %d resource(s) for gateway %s", len(records), gateway_id)
+    except Exception as exc:
+        logger.warning("Inventory announcement failed for %s: %s", gateway_id, exc)
+
+
+def _tool_name_of(request_payload: str) -> str:
+    """The tool a tools/call request names, or "" for anything else."""
+    try:
+        body = json.loads(request_payload) if request_payload else {}
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(body, dict) or body.get("method") != "tools/call":
+        return ""
+    return str(((body.get("params") or {}).get("name") or "")).strip()
+
+
+def _resolve_server(gateway_id: str, gateway_name: str, request_payload: str) -> Dict[str, str]:
+    """The target behind this call, as tags.
+
+    A gateway is a front door: the tool actually runs on one of its targets, and
+    until this resolution existed a target survived only as the prefix inside a
+    namespaced tool name. Calls that name no tool (initialize, tools/list) have
+    no target and deliberately return nothing, so they stay attributed to the
+    gateway rather than being guessed onto a server.
+    """
+    target = target_for_tool(gateway_id, _tool_name_of(request_payload))
+    if not target:
+        return {}
+    return {
+        "mcp-server-name": target.get("name", ""),
+        "mcp-server-target-id": target.get("target_id", ""),
+        "mcp-server-kind": target.get("kind", ""),
+        "mcp-server-endpoint": target.get("backend", ""),
+        "mcp-server-host": target.get("host", ""),
+        # "none" is a finding, not missing data: the gateway reaches this
+        # backend with no credential provider at all.
+        "mcp-server-auth": target.get("auth", ""),
+        "mcp-server-status": target.get("status", ""),
+        "mcp-server-listing-mode": target.get("listing_mode", ""),
+        "mcp-server-private": target.get("private", ""),
+        # target.gateway — unique per server, and stable regardless of which
+        # agent called it.
+        "bot-name": f"{target.get('name','')}.{gateway_name}" if gateway_name else target.get("name", ""),
+    }
+
+
+def _gateway_inventory(gateway_id: str) -> Dict[str, str]:
+    """What sits behind the gateway, for records that name no single server."""
+    targets = targets_for_gateway(gateway_id)
+    if not targets:
+        return {}
+    return {
+        "gateway-target-count": str(len(targets)),
+        "gateway-targets": ",".join(t.get("name", "") for t in targets),
+        "gateway-target-kinds": ",".join(sorted({t.get("kind", "") for t in targets})),
+        "gateway-target-hosts": ",".join(t.get("host", "") for t in targets),
+        "gateway-unauthenticated-targets": str(sum(1 for t in targets if t.get("auth") == "none")),
+    }
+
+
 def _build_tags(is_mcp: bool, identity: Optional[Dict[str, str]] = None,
                 caller: Optional[Dict[str, str]] = None,
                 agent_profile: Optional[Dict[str, str]] = None,
@@ -638,7 +791,8 @@ def _embed_aws_metadata(response_payload: str, aws_metadata: Dict[str, str]) -> 
 def _build_ingest_payload(*, request_payload: str, response_payload: str,
                           request_headers: Dict[str, str], response_headers: Dict[str, str],
                           status_code: Optional[int], is_mcp: bool,
-                          path: str = "/mcp", method: str = "POST") -> Dict[str, Any]:
+                          path: str = "/mcp", method: str = "POST",
+                          embed_metadata: bool = True) -> Dict[str, Any]:
     """HTTP-proxy IngestDataBatch shape expected by the guardrails service
     (models.IngestDataBatch). Carries the real gateway headers/status, not
     synthesised values."""
@@ -649,6 +803,24 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     agent_profile = _agent_role_profile(caller)
     gateway_profile = _gateway_role_profile(identity.get("gateway_id", ""))
     tags = _build_tags(is_mcp, identity, caller, agent_profile, gateway_profile)
+
+    gateway_id = identity.get("gateway_id", "")
+    _announce_inventory(gateway_id, identity.get("gateway_name", ""), identity.get("host", ""))
+    # Server first, gateway inventory second: a call that names a server is
+    # attributed to it, and only a call that names none keeps the gateway's own
+    # identity. bot-name and the Host header follow whichever won.
+    server = _resolve_server(gateway_id, identity.get("gateway_name", ""), request_payload)
+    if server:
+        tags.update(server)
+        request_headers = _set_host_header(request_headers, server.get("mcp-server-host", ""))
+    else:
+        tags.update(_gateway_inventory(gateway_id))
+        # Only the gateway is left to name this record — unless the caller was
+        # identified, which is a more specific answer than the door it came
+        # through and must not be overwritten.
+        if identity.get("gateway_name") and not caller.get("agent-name"):
+            tags["bot-name"] = identity["gateway_name"]
+
     if not caller.get("agent-name"):
         match = _RUNTIME_INVOCATION_PATH.search(path)
         if match:
@@ -665,8 +837,13 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     # server-side and never reaches the reader — which is exactly how the
     # discovery pipeline does it (traceMessageBuilder.js builds
     # responsePayload = {response, awsMetadata}).
-    aws_metadata = _build_aws_metadata(tags, request_payload)
-    response_payload = _embed_aws_metadata(response_payload, aws_metadata)
+    # Only on the request leg. There, responsePayload is a placeholder that
+    # exists solely to carry this. On the response leg it is the live body the
+    # guardrail may rewrite and the interceptor then returns to the caller, so
+    # anything added to it would be served to the client as the tool's result.
+    if embed_metadata:
+        response_payload = _embed_aws_metadata(
+            response_payload, _build_aws_metadata(tags, request_payload))
 
     return {
         "path": path,
@@ -930,6 +1107,7 @@ def _handle_http_response(http: Dict[str, Any], context: Any = None) -> Dict[str
         payload = _build_ingest_payload(
             request_payload=request_payload,
             response_payload=response_body,
+            embed_metadata=False,
             request_headers=_clean_headers(gateway_request.get("headers")),
             response_headers=_clean_headers(gateway_response.get("headers")),
             status_code=status_code,
@@ -1079,6 +1257,7 @@ def _handle_response(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         payload = _build_ingest_payload(
             request_payload=json.dumps(req_body),
             response_payload=json.dumps(resp_body),
+            embed_metadata=False,
             request_headers=_clean_headers(gateway_request.get("headers")),
             response_headers=_clean_headers(gateway_response.get("headers")),
             status_code=status_code,

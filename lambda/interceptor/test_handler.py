@@ -4,7 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from akto_agentcore import agentcore_lookup, core as handler, gateway_naming
+from akto_agentcore import agentcore_lookup, core as handler, gateway_naming, gateway_targets
 from akto_agentcore import wrap_interceptor
 
 
@@ -882,8 +882,9 @@ class PayloadIdentityTests(unittest.TestCase):
 
     def test_falls_back_to_the_gateway_when_the_caller_is_unknown(self):
         tags = json.loads(self._payload("")["tag"])
-        # The host verbatim — AKTO's collection is keyed on the same value.
-        self.assertEqual(tags["bot-name"], GATEWAY_HOST)
+        # A record naming no server is the gateway's own; it is identified by
+        # the gateway's name, while the collection stays keyed on its host.
+        self.assertEqual(tags["bot-name"], "asl-gateway-demo")
         self.assertEqual(tags["gateway-name"], "asl-gateway-demo")
         self.assertEqual(tags["agentType"], "AGENTCORE_GATEWAY")
         self.assertNotIn("caller-role", tags)
@@ -1026,6 +1027,156 @@ class PayloadIdentityTests(unittest.TestCase):
         # No Host means no gateway; the synthetic fallback must not be mistaken for one.
         self.assertNotIn("gateway-id", tags)
         self.assertEqual(json.loads(payload["requestHeaders"])["host"], "agentcore_gateway.mcp")
+
+
+
+class GatewayTargetNormalisationTests(unittest.TestCase):
+    """A target is the server behind the gateway; each AWS union variant names
+    its backend differently and must still yield one usable host."""
+
+    def test_mcp_server_uses_the_endpoint_hostname(self):
+        kind, backend, host = gateway_targets._describe_backend(
+            {"mcp": {"mcpServer": {"endpoint": "https://docs.akto.io/~gitbook/mcp"}}}, "mac-akto-api-mcp")
+        self.assertEqual((kind, host), ("mcpServer", "docs.akto.io"))
+        self.assertEqual(backend, "https://docs.akto.io/~gitbook/mcp")
+
+    def test_agentcore_runtime_uses_the_runtime_name_without_the_id_suffix(self):
+        kind, _, host = gateway_targets._describe_backend(
+            {"http": {"agentcoreRuntime": {
+                "arn": "arn:aws:bedrock-agentcore:us-east-1:041877753357:runtime/asl_demo_agent_demo-wxoIOE9Fdr"}}},
+            "demo-agent")
+        self.assertEqual((kind, host), ("agentcoreRuntime", "asl_demo_agent_demo"))
+
+    def test_lambda_uses_the_function_name(self):
+        kind, _, host = gateway_targets._describe_backend(
+            {"mcp": {"lambda": {"arn": "arn:aws:lambda:us-east-1:1:function:my-fn"}}}, "lam")
+        self.assertEqual((kind, host), ("lambda", "my-fn"))
+
+    def test_unknown_variant_still_yields_an_attributable_host(self):
+        kind, _, host = gateway_targets._describe_backend({"mcp": {"somethingNew": {}}}, "future-target")
+        self.assertEqual((kind, host), ("unknown", "future-target"))
+
+    def test_absent_credential_provider_reads_as_none_not_blank(self):
+        self.assertEqual(gateway_targets._auth_of({"credentialProviderConfigurations": None}), "none")
+        self.assertEqual(gateway_targets._auth_of(
+            {"credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}]}),
+            "GATEWAY_IAM_ROLE")
+
+    def test_tool_namespace_split(self):
+        self.assertEqual(gateway_targets.target_name_from_tool("mac-akto-api-mcp___searchDocumentation"),
+                         "mac-akto-api-mcp")
+        self.assertEqual(gateway_targets.target_name_from_tool("searchDocumentation"), "")
+
+
+class ServerAttributionTests(unittest.TestCase):
+    """bot-name and the collection follow the server a call actually reached."""
+
+    TARGETS = [
+        {"name": "mac-akto-api-mcp", "target_id": "3YAFQQEOOA", "kind": "mcpServer",
+         "backend": "https://docs.akto.io/~gitbook/mcp", "host": "docs.akto.io",
+         "auth": "none", "status": "READY", "listing_mode": "DEFAULT", "private": "false"},
+        {"name": "mac-akto-ai-mcp", "target_id": "913O5G8MS4", "kind": "mcpServer",
+         "backend": "https://ai-security-docs.akto.io/~gitbook/mcp", "host": "ai-security-docs.akto.io",
+         "auth": "none", "status": "READY", "listing_mode": "DEFAULT", "private": "false"},
+    ]
+
+    def setUp(self):
+        self._saved = (handler.targets_for_gateway, handler.target_for_tool,
+                       handler.gateway_role_arn, handler.AWS_REGION, handler.DISCOVER_ON_START)
+        handler.targets_for_gateway = lambda gid: self.TARGETS
+        handler.target_for_tool = lambda gid, tool: next(
+            (t for t in self.TARGETS if tool.startswith(t["name"] + "___")), None)
+        handler.gateway_role_arn = lambda gid: ""
+        handler.AWS_REGION = "us-east-1"
+        handler.DISCOVER_ON_START = False      # announcement covered separately
+        handler._INVOCATION["principal"] = ""
+        handler._INVOCATION["account_id"] = "041877753357"
+
+    def tearDown(self):
+        (handler.targets_for_gateway, handler.target_for_tool,
+         handler.gateway_role_arn, handler.AWS_REGION, handler.DISCOVER_ON_START) = self._saved
+
+    def _payload(self, body):
+        return handler._build_ingest_payload(
+            request_payload=json.dumps(body), response_payload="{}",
+            request_headers={"Host": GATEWAY_HOST}, response_headers={},
+            status_code=200, is_mcp=True)
+
+    def _call(self, tool):
+        return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool}}
+
+    def test_tool_call_is_attributed_to_its_server(self):
+        p = self._payload(self._call("mac-akto-api-mcp___searchDocumentation"))
+        tags = json.loads(p["tag"])
+        self.assertEqual(tags["bot-name"], "mac-akto-api-mcp.asl-gateway-demo")
+        self.assertEqual(tags["mcp-server-host"], "docs.akto.io")
+        self.assertEqual(tags["mcp-server-endpoint"], "https://docs.akto.io/~gitbook/mcp")
+        self.assertEqual(tags["mcp-server-auth"], "none")
+        self.assertEqual(json.loads(p["requestHeaders"])["host"], "docs.akto.io")
+
+    def test_two_servers_on_one_gateway_stay_separate(self):
+        a = json.loads(self._payload(self._call("mac-akto-api-mcp___searchDocumentation"))["tag"])
+        b = json.loads(self._payload(self._call("mac-akto-ai-mcp___getPage"))["tag"])
+        self.assertNotEqual(a["bot-name"], b["bot-name"])
+        self.assertEqual(b["bot-name"], "mac-akto-ai-mcp.asl-gateway-demo")
+        self.assertEqual(b["mcp-server-host"], "ai-security-docs.akto.io")
+
+    def test_non_tool_call_stays_with_the_gateway_and_lists_its_inventory(self):
+        p = self._payload({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tags = json.loads(p["tag"])
+        self.assertEqual(tags["bot-name"], "asl-gateway-demo")
+        self.assertEqual(tags["gateway-target-count"], "2")
+        self.assertEqual(tags["gateway-unauthenticated-targets"], "2")
+        self.assertNotIn("mcp-server-name", tags)
+        # The collection must stay the gateway's, not a server's.
+        self.assertEqual(json.loads(p["requestHeaders"])["Host"], GATEWAY_HOST)
+
+    def test_unknown_tool_prefix_falls_back_to_the_gateway(self):
+        tags = json.loads(self._payload(self._call("not-a-target___doThing"))["tag"])
+        self.assertEqual(tags["bot-name"], "asl-gateway-demo")
+        self.assertNotIn("mcp-server-name", tags)
+
+
+class InventoryAnnouncementTests(unittest.TestCase):
+    """The inventory must exist in AKTO before any tool is called."""
+
+    def setUp(self):
+        self.sent = []
+        self._saved = (handler.targets_for_gateway, handler._post_json,
+                       handler._gateway_role_profile, handler.AWS_REGION)
+        handler.targets_for_gateway = lambda gid: ServerAttributionTests.TARGETS
+        handler._post_json = lambda url, payload: self.sent.append(payload) or {}
+        handler._gateway_role_profile = lambda gid: {}
+        handler.AWS_REGION = "us-east-1"
+        handler._discovery_done = False
+        handler._INVOCATION["account_id"] = "041877753357"
+
+    def tearDown(self):
+        (handler.targets_for_gateway, handler._post_json,
+         handler._gateway_role_profile, handler.AWS_REGION) = self._saved
+        handler._discovery_done = False
+
+    def test_announces_the_gateway_and_every_server(self):
+        handler._announce_inventory("asl-gateway-demo-lfexb4ol0c", "asl-gateway-demo", GATEWAY_HOST)
+        names = [json.loads(p["tag"])["bot-name"] for p in self.sent]
+        self.assertEqual(names, ["asl-gateway-demo",
+                                 "mac-akto-api-mcp.asl-gateway-demo",
+                                 "mac-akto-ai-mcp.asl-gateway-demo"])
+        for p in self.sent:
+            self.assertEqual(json.loads(p["tag"])["discovery-type"], "METADATA_ONLY")
+
+    def test_server_records_carry_the_backend_and_its_auth_posture(self):
+        handler._announce_inventory("asl-gateway-demo-lfexb4ol0c", "asl-gateway-demo", GATEWAY_HOST)
+        server = json.loads(self.sent[1]["tag"])
+        self.assertEqual(server["mcp-server-endpoint"], "https://docs.akto.io/~gitbook/mcp")
+        self.assertEqual(server["mcp-server-auth"], "none")
+        self.assertEqual(json.loads(self.sent[1]["requestHeaders"])["host"], "docs.akto.io")
+
+    def test_runs_once_per_container(self):
+        handler._announce_inventory("asl-gateway-demo-lfexb4ol0c", "asl-gateway-demo", GATEWAY_HOST)
+        first = len(self.sent)
+        handler._announce_inventory("asl-gateway-demo-lfexb4ol0c", "asl-gateway-demo", GATEWAY_HOST)
+        self.assertEqual(len(self.sent), first)
 
 
 
