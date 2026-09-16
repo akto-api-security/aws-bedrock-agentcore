@@ -871,11 +871,14 @@ class PayloadIdentityTests(unittest.TestCase):
         self.assertEqual(tags["agentType"], "RUNTIME")
         self.assertEqual(tags["caller-role"], "asl-demo-agent-execution-demo-karan")
 
-    def test_mcp_traffic_keeps_the_gateway_host(self):
+    def test_host_header_carries_bot_name(self):
+        # AKTO keys collections on the host header, so it carries bot-name
+        # rather than whatever hostname the traffic physically went to.
         payload = self._payload(RUNTIME_ARN)
         headers = json.loads(payload["requestHeaders"])
         host = next(v for k, v in headers.items() if k.lower() == "host")
-        self.assertEqual(host, GATEWAY_HOST)
+        self.assertEqual(host, json.loads(payload["tag"])["bot-name"])
+        self.assertEqual(host, "asl_demo_agent_demo")
 
     def test_same_gateway_different_caller_gets_a_different_bot_name(self):
         self.assertEqual(json.loads(self._payload(HARNESS_ARN)["tag"])["bot-name"], "harness_khsh4")
@@ -1112,7 +1115,9 @@ class ServerAttributionTests(unittest.TestCase):
         self.assertEqual(tags["mcp-server-host"], "docs.akto.io")
         self.assertEqual(tags["mcp-server-endpoint"], "https://docs.akto.io/~gitbook/mcp")
         self.assertEqual(tags["mcp-server-auth"], "none")
-        self.assertEqual(json.loads(p["requestHeaders"])["host"], "docs.akto.io")
+        # The collection is named for the server; its real hostname stays in the tags.
+        self.assertEqual(json.loads(p["requestHeaders"])["host"],
+                         "mac-akto-api-mcp.asl-gateway-demo")
 
     def test_two_servers_on_one_gateway_stay_separate(self):
         a = json.loads(self._payload(self._call("mac-akto-api-mcp___searchDocumentation"))["tag"])
@@ -1129,7 +1134,7 @@ class ServerAttributionTests(unittest.TestCase):
         self.assertEqual(tags["gateway-unauthenticated-targets"], "2")
         self.assertNotIn("mcp-server-name", tags)
         # The collection must stay the gateway's, not a server's.
-        self.assertEqual(json.loads(p["requestHeaders"])["Host"], GATEWAY_HOST)
+        self.assertEqual(json.loads(p["requestHeaders"])["host"], "asl-gateway-demo")
 
     def test_unknown_tool_prefix_falls_back_to_the_gateway(self):
         tags = json.loads(self._payload(self._call("not-a-target___doThing"))["tag"])
@@ -1170,7 +1175,8 @@ class InventoryAnnouncementTests(unittest.TestCase):
         server = json.loads(self.sent[1]["tag"])
         self.assertEqual(server["mcp-server-endpoint"], "https://docs.akto.io/~gitbook/mcp")
         self.assertEqual(server["mcp-server-auth"], "none")
-        self.assertEqual(json.loads(self.sent[1]["requestHeaders"])["host"], "docs.akto.io")
+        self.assertEqual(json.loads(self.sent[1]["requestHeaders"])["host"],
+                         "mac-akto-api-mcp.asl-gateway-demo")
 
     def test_runs_once_per_container(self):
         handler._announce_inventory("asl-gateway-demo-lfexb4ol0c", "asl-gateway-demo", GATEWAY_HOST)

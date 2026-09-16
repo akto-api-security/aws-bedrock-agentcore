@@ -507,7 +507,11 @@ def _discovery_record(bot_name: str, host: str, extra: Dict[str, str]) -> Dict[s
     }
     return {
         "path": "/mcp",
-        "requestHeaders": json.dumps({"host": host, "Content-Type": "application/json"}),
+        # Akto groups records into collections by the host header, so it carries
+        # bot-name — the identity the collection should be named after. The real
+        # backend hostname stays in the tags (mcp-server-host / gateway-host).
+        "requestHeaders": json.dumps({"host": bot_name or host,
+                                      "Content-Type": "application/json"}),
         "responseHeaders": json.dumps({}),
         "method": "POST",
         "requestPayload": json.dumps({"discovery": bot_name}),
@@ -545,6 +549,7 @@ def _announce_inventory(gateway_id: str, gateway_name: str, gateway_host: str) -
         records = [_discovery_record(
             gateway_name or gateway_id, gateway_host,
             {"gateway-id": gateway_id, "gateway-name": gateway_name,
+             "gateway-host": gateway_host,
              **_gateway_inventory(gateway_id),
              **_gateway_role_profile(gateway_id)},
         )]
@@ -812,7 +817,6 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     server = _resolve_server(gateway_id, identity.get("gateway_name", ""), request_payload)
     if server:
         tags.update(server)
-        request_headers = _set_host_header(request_headers, server.get("mcp-server-host", ""))
     else:
         tags.update(_gateway_inventory(gateway_id))
         # Only the gateway is left to name this record — unless the caller was
@@ -830,8 +834,10 @@ def _build_ingest_payload(*, request_payload: str, response_payload: str,
     # HTTP reason phrase ("OK", "Not Found", ...).
     code = status_code if status_code is not None else 200
     request_headers = _ensure_host(request_headers, is_mcp)
-    if not is_mcp:
-        request_headers = _set_host_header(request_headers, tags.get("bot-name", ""))
+    # Set last, once bot-name is final. Akto collections are keyed on the host
+    # header, so it carries bot-name rather than the backend's own hostname —
+    # which remains available as mcp-server-host.
+    request_headers = _set_host_header(request_headers, tags.get("bot-name", ""))
     # awsMetadata travels INSIDE responsePayload, not as a top-level field.
     # AKTO's ingest schema is fixed, so an unrecognised top-level key is dropped
     # server-side and never reaches the reader — which is exactly how the
