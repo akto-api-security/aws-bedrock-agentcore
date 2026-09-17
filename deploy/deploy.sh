@@ -95,7 +95,9 @@ if [ -z "${LAMBDA_ROLE_ARN:-}" ]; then
             "bedrock-agentcore:ListAgentRuntimes",
             "bedrock-agentcore:GetAgentRuntime",
             "bedrock-agentcore:ListHarnesses",
-            "bedrock-agentcore:GetHarness"
+            "bedrock-agentcore:GetHarness",
+            "bedrock-agentcore:ListGatewayTargets",
+            "bedrock-agentcore:GetGatewayTarget"
           ],
           "Resource": "*" },
         { "Effect": "Allow",
