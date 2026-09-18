@@ -26,7 +26,7 @@ Behaviour at the gateway:
   - behaviour "human_approval" -> poll /api/http-proxy with activityId until
     approved/blocked; unresolved decisions follow AKTO_FAIL_OPEN.
   - Modified=true -> substitute Akto's ModifiedPayload (arg rewrite / redaction).
-  - Only `tools/call` is guardrailed; other MCP methods (initialize, tools/list,
+  - `tools/call` and `tools/list` are guardrailed; other MCP methods (initialize,
     notifications/*, ping) and stream-borne server requests pass through.
 
 Interceptor output contract (AWS docs):
@@ -68,7 +68,7 @@ AKTO_APPROVAL_SAFETY_SECONDS = 5.0
 AKTO_CONNECTOR = "agentcore_gateway"   # akto_connector query param + client tag
 CONTEXT_SOURCE = "AGENTIC"             # contextSource for policy filtering
 INTERCEPTOR_OUTPUT_VERSION = "1.0"
-GUARDED_METHODS = {"tools/call"}
+GUARDED_METHODS = {"tools/call", "tools/list"}
 
 # Matches the discovery pipeline in akto_aws_bedrock_discovery, so a gateway AKTO
 # discovered and the traffic flowing through it group together in the dashboard.
@@ -1175,7 +1175,7 @@ def _handle_request(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
         return _jsonrpc_error(request_id, _block_message("Akto not configured", is_response=False))
 
     tool_name = (body.get("params") or {}).get("name", "unknown")
-    logger.info("Guardrailing REQUEST tools/call: %s", tool_name)
+    logger.info("Guardrailing REQUEST %s: %s", method, tool_name)
 
     try:
         payload = _build_ingest_payload(
@@ -1207,7 +1207,7 @@ def _handle_request(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]:
         )
 
     if _should_block(result.allowed, result.behaviour):
-        logger.warning("BLOCKING tools/call %s: %s", tool_name, result.reason)
+        logger.warning("BLOCKING %s %s: %s", method, tool_name, result.reason)
         return _jsonrpc_error(request_id, _block_message(result.reason, is_response=False))
 
     # Apply guardrail-modified arguments if Akto rewrote them.
@@ -1235,9 +1235,10 @@ def _handle_response(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]
     status_code = gateway_response.get("statusCode", 200)
     request_id = resp_body.get("id", req_body.get("id"))
     is_streaming = bool(gateway_response.get("isStreamingResponse"))
+    method = req_body.get("method", "")
 
-    # Only guardrail tool-call results; pass through lifecycle / list responses.
-    if req_body.get("method") not in GUARDED_METHODS:
+    # Only guardrail GUARDED_METHODS results; pass through other lifecycle responses.
+    if method not in GUARDED_METHODS:
         return _passthrough_response(resp_body, status_code)
 
     # Server-initiated requests on a stream (elicitation/create, sampling/...)
@@ -1256,8 +1257,8 @@ def _handle_response(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         )
 
     tool_name = (req_body.get("params") or {}).get("name", "unknown")
-    logger.info("Guardrailing RESPONSE tools/call result: %s (streaming=%s)",
-                tool_name, is_streaming)
+    logger.info("Guardrailing RESPONSE %s result: %s (streaming=%s)",
+                method, tool_name, is_streaming)
 
     try:
         payload = _build_ingest_payload(
@@ -1291,7 +1292,7 @@ def _handle_response(mcp: Dict[str, Any], context: Any = None) -> Dict[str, Any]
         )
 
     if _should_block(result.allowed, result.behaviour):
-        logger.warning("BLOCKING tools/call result %s: %s", tool_name, result.reason)
+        logger.warning("BLOCKING %s result %s: %s", method, tool_name, result.reason)
         # On a subsequent streaming event statusCode is ignored by the gateway,
         # but the error body still replaces the event.
         return _jsonrpc_error(request_id, _block_message(result.reason, is_response=True),
